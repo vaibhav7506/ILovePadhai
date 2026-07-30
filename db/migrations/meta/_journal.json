@@ -1,0 +1,62 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1785369600000,
+      "tag": "0000_phase_1_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1785456000000,
+      "tag": "0001_phase_2_verified_content",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1785459600000,
+      "tag": "0002_phase_2_review_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1785542400000,
+      "tag": "0003_phase_3_attempt_engine",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1785628800000,
+      "tag": "0004_phase_4_results_leaderboards",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1785715200000,
+      "tag": "0005_phase_5_personalised_preparation",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1785888000000,
+      "tag": "0006_phase_6_resilience",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1785974400000,
+      "tag": "0007_ai_assessment_and_learning",
+      "breakpoints": true
+    }
+  ]
+}

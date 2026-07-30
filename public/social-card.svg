@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#F3F6F4"/>
+  <path d="M0 0h24v630H0z" fill="#7A263A"/>
+  <g transform="translate(92 92)">
+    <rect width="1016" height="446" rx="18" fill="#fff" stroke="#D7DEDA" stroke-width="3"/>
+    <text x="62" y="105" font-family="Arial, sans-serif" font-size="30" fill="#7A263A" letter-spacing="4">THE EXAMINATION DESK</text>
+    <text x="62" y="194" font-family="Arial, sans-serif" font-size="76" font-weight="700" fill="#18201E">ExamForge</text>
+    <text x="62" y="252" font-family="Arial, sans-serif" font-size="30" fill="#5C6763">Verified practice. Honest progress. No account required.</text>
+    <g transform="translate(62 324)" fill="none" stroke-width="5">
+      <circle cx="20" cy="20" r="17" stroke="#7A263A"/><circle cx="76" cy="20" r="17" stroke="#D7DEDA"/>
+      <circle cx="132" cy="20" r="17" stroke="#D7DEDA"/><circle cx="188" cy="20" r="17" stroke="#D7DEDA"/>
+      <path d="m10 20 7 8 15-18" stroke="#7A263A" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

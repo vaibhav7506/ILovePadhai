@@ -1,0 +1,10 @@
+# Copy to .dev.vars for local Worker development. Never commit real secrets.
+TURNSTILE_SECRET_KEY=replace-with-a-cloudflare-turnstile-secret
+TURNSTILE_MODE=off
+TURNSTILE_HOSTNAMES=localhost,127.0.0.1
+LOCAL_ADMIN_TOKEN=replace-with-a-long-random-local-token
+ATTEMPT_SIGNING_SECRET=replace-with-at-least-32-random-characters
+# Optional. Keep off until the secret is configured with `wrangler secret put GROQ_API_KEY`.
+GROQ_ENABLED=off
+GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_API_KEY=replace-only-in-local-dev-vars
