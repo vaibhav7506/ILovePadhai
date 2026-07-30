@@ -45,6 +45,11 @@ npx wrangler secret put GROQ_API_KEY --env production
 ```
 
 Then set `GROQ_ENABLED` to `on`. Never prefix Groq or secret names with `VITE_`.
+Keep `GROQ_MODEL=llama-3.3-70b-versatile` for question generation and set
+`GROQ_VERIFICATION_MODEL=openai/gpt-oss-20b` for answer verification. These are non-secret
+Worker variables. The separate models keep generation and verification in separate provider
+rate-limit pools; malformed generation is repaired by `GROQ_MODEL`, while verification and its
+bounded repair use `GROQ_VERIFICATION_MODEL`.
 
 For local development, copy `.dev.vars.example` to `.dev.vars` and use non-production values.
 `.dev.vars` is ignored and must never be committed.

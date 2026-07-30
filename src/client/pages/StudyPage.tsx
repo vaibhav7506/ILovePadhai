@@ -91,7 +91,11 @@ interface LearningActivity {
   check?: {
     checkId: string;
     passingPercent: number;
-    questions: Array<{ id: string; questionText: string; options: Array<{ optionIndex: number; optionText: string }> }>;
+    questions: {
+      id: string;
+      questionText: string;
+      options: { optionIndex: number; optionText: string }[];
+    }[];
   };
 }
 
@@ -243,12 +247,25 @@ export function StudyPage() {
   const openLearning = async (id: string) => {
     if (!visitorUuid) return;
     const response = await fetch(`/api/study/plan/${id}/open`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ visitorUuid }),
     });
-    const result = (await response.json()) as { state?: string; lesson?: LearningActivity['lesson']; error?: string };
-    if (!response.ok || !result.lesson) { setMessage(result.error ?? 'The lesson could not be opened.'); return; }
-    setLearning({ itemId: id, openedAt: Date.now(), state: result.state ?? 'reading', lesson: result.lesson });
+    const result = (await response.json()) as {
+      state?: string;
+      lesson?: LearningActivity['lesson'];
+      error?: string;
+    };
+    if (!response.ok || !result.lesson) {
+      setMessage(result.error ?? 'The lesson could not be opened.');
+      return;
+    }
+    setLearning({
+      itemId: id,
+      openedAt: Date.now(),
+      state: result.state ?? 'reading',
+      lesson: result.lesson,
+    });
     setCheckAnswers({});
   };
 
@@ -256,28 +273,66 @@ export function StudyPage() {
     if (!visitorUuid || !learning) return;
     const visibleSeconds = Math.max(0, Math.floor((Date.now() - learning.openedAt) / 1000));
     const engagementResponse = await fetch(`/api/study/plan/${learning.itemId}/engagement`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ visitorUuid, engagedSeconds: visibleSeconds, visibleSeconds, scrollPercent: 100, sectionsOpened: 1, examplesInteracted: 0 }),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        visitorUuid,
+        engagedSeconds: visibleSeconds,
+        visibleSeconds,
+        scrollPercent: 100,
+        sectionsOpened: 1,
+        examplesInteracted: 0,
+      }),
     });
-    const engagement = (await engagementResponse.json()) as { state?: string; message?: string; error?: string };
-    if (engagement.state !== 'check_required') { setMessage(engagement.message ?? engagement.error ?? 'Continue reviewing the lesson.'); return; }
+    const engagement = (await engagementResponse.json()) as {
+      state?: string;
+      message?: string;
+      error?: string;
+    };
+    if (engagement.state !== 'check_required') {
+      setMessage(engagement.message ?? engagement.error ?? 'Continue reviewing the lesson.');
+      return;
+    }
     const checkResponse = await fetch(`/api/study/plan/${learning.itemId}/checks`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visitorUuid }),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ visitorUuid }),
     });
     const check = (await checkResponse.json()) as LearningActivity['check'] & { error?: string };
-    if (!checkResponse.ok || !check.checkId) { setMessage(check.error ?? 'A verified check is not available.'); return; }
+    if (!checkResponse.ok || !check.checkId) {
+      setMessage(check.error ?? 'A verified check is not available.');
+      return;
+    }
     setLearning({ ...learning, state: 'check_required', check });
   };
 
   const submitCheck = async () => {
     if (!visitorUuid || !learning?.check) return;
     const response = await fetch(`/api/study/plan/${learning.itemId}/checks/submit`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ visitorUuid, checkId: learning.check.checkId, answers: learning.check.questions.map((question) => ({ questionId: question.id, selectedOptionIndex: checkAnswers[question.id] ?? null })) }),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        visitorUuid,
+        checkId: learning.check.checkId,
+        answers: learning.check.questions.map((question) => ({
+          questionId: question.id,
+          selectedOptionIndex: checkAnswers[question.id] ?? null,
+        })),
+      }),
     });
-    const result = (await response.json()) as { passed?: boolean; scorePercent?: number; nextAction?: string; error?: string };
-    if (!response.ok) { setMessage(result.error ?? 'The check could not be scored.'); return; }
-    setMessage(`${result.passed ? 'Topic completed' : 'Retry required'} · ${String(result.scorePercent)}%. ${result.nextAction ?? ''}`);
+    const result = (await response.json()) as {
+      passed?: boolean;
+      scorePercent?: number;
+      nextAction?: string;
+      error?: string;
+    };
+    if (!response.ok) {
+      setMessage(result.error ?? 'The check could not be scored.');
+      return;
+    }
+    setMessage(
+      `${result.passed ? 'Topic completed' : 'Retry required'} · ${String(result.scorePercent)}%. ${result.nextAction ?? ''}`,
+    );
     setLearning(undefined);
     await load();
   };
@@ -420,7 +475,9 @@ export function StudyPage() {
             </div>
             {dashboard.studyProgress && (
               <p className="study-message">
-                {dashboard.studyProgress.completionPercent}% complete · {dashboard.studyProgress.completed} passed · {dashboard.studyProgress.retryRequired} retry · {dashboard.studyProgress.skipped} skipped
+                {dashboard.studyProgress.completionPercent}% complete ·{' '}
+                {dashboard.studyProgress.completed} passed · {dashboard.studyProgress.retryRequired}{' '}
+                retry · {dashboard.studyProgress.skipped} skipped
               </p>
             )}
             {dashboard.plan.length === 0 ? (
@@ -465,19 +522,36 @@ export function StudyPage() {
                   </button>
                 ) : (
                   <div>
-                    <p>Pass mark: {learning.check.passingPercent}%. Answers remain hidden until submission.</p>
+                    <p>
+                      Pass mark: {learning.check.passingPercent}%. Answers remain hidden until
+                      submission.
+                    </p>
                     {learning.check.questions.map((question, questionIndex) => (
                       <fieldset key={question.id}>
-                        <legend>{questionIndex + 1}. {question.questionText}</legend>
+                        <legend>
+                          {questionIndex + 1}. {question.questionText}
+                        </legend>
                         {question.options.map((option) => (
                           <label key={option.optionIndex}>
-                            <input checked={checkAnswers[question.id] === option.optionIndex} name={question.id} onChange={() => setCheckAnswers((current) => ({ ...current, [question.id]: option.optionIndex }))} type="radio" />
+                            <input
+                              checked={checkAnswers[question.id] === option.optionIndex}
+                              name={question.id}
+                              onChange={() => {
+                                setCheckAnswers((current) => ({
+                                  ...current,
+                                  [question.id]: option.optionIndex,
+                                }));
+                              }}
+                              type="radio"
+                            />
                             {option.optionText}
                           </label>
                         ))}
                       </fieldset>
                     ))}
-                    <button className="primary-button" onClick={() => void submitCheck()}>Submit comprehension check</button>
+                    <button className="primary-button" onClick={() => void submitCheck()}>
+                      Submit comprehension check
+                    </button>
                   </div>
                 )}
               </article>

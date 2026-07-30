@@ -7,4 +7,9 @@ ATTEMPT_SIGNING_SECRET=replace-with-at-least-32-random-characters
 # Optional. Keep off until the secret is configured with `wrangler secret put GROQ_API_KEY`.
 GROQ_ENABLED=off
 GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_VERIFICATION_MODEL=openai/gpt-oss-20b
 GROQ_API_KEY=replace-only-in-local-dev-vars
+AI_GENERATION_ENABLED=on
+AI_VISITOR_DAILY_LIMIT=5
+AI_GLOBAL_DAILY_REQUEST_LIMIT=500
+AI_GLOBAL_DAILY_TOKEN_LIMIT=2000000

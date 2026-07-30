@@ -252,7 +252,8 @@ routes.get('/api/study/dashboard', async (context) => {
   }
   const learningCounts = { completed: 0, retryRequired: 0, skipped: 0, planned: 0 };
   for (const item of plan) {
-    const state = String(Reflect.get(item, 'learningState') ?? 'not_started');
+    const learningState: unknown = Reflect.get(item, 'learningState');
+    const state = typeof learningState === 'string' ? learningState : 'not_started';
     if (state === 'completed') learningCounts.completed += 1;
     else if (state === 'retry_required') learningCounts.retryRequired += 1;
     else if (state === 'skipped') learningCounts.skipped += 1;
@@ -279,7 +280,11 @@ routes.get('/api/study/dashboard', async (context) => {
     ).length,
     studyProgress: {
       ...learningCounts,
-      completionPercent: studyCompletionPercent(learningCounts.completed, learningCounts.retryRequired, learningCounts.planned),
+      completionPercent: studyCompletionPercent(
+        learningCounts.completed,
+        learningCounts.retryRequired,
+        learningCounts.planned,
+      ),
     },
   });
 });
@@ -307,9 +312,16 @@ routes.put('/api/study/plan/:id', zValidator('json', planItemUpdateSchema), asyn
     .bind(input.status, null, context.req.param('id'), visitor.visitor_number)
     .run();
   if (result.meta.changes === 0) return context.json({ error: 'Plan item not found.' }, 404);
-  await context.env.DB.prepare(`INSERT INTO study_task_learning (plan_item_id,state,updated_at) VALUES (?,?,?)
-    ON CONFLICT(plan_item_id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at`)
-    .bind(context.req.param('id'), input.status === 'skipped' ? 'skipped' : 'not_started', timestamp).run();
+  await context.env.DB.prepare(
+    `INSERT INTO study_task_learning (plan_item_id,state,updated_at) VALUES (?,?,?)
+    ON CONFLICT(plan_item_id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at`,
+  )
+    .bind(
+      context.req.param('id'),
+      input.status === 'skipped' ? 'skipped' : 'not_started',
+      timestamp,
+    )
+    .run();
   return context.json({ status: input.status });
 });
 
@@ -318,106 +330,244 @@ routes.post('/api/study/plan/:id/open', async (context) => {
   if (!body.success) return context.json({ error: 'Valid anonymous visitor required.' }, 400);
   const visitor = await visitorFor(context.env.DB, body.data.visitorUuid);
   if (!visitor) return context.json({ error: 'Anonymous visitor not found.' }, 404);
-  const item = await context.env.DB.prepare(`SELECT p.id,p.subject,p.topic,p.rationale,sp.target_examination_id AS examId,
+  const item = await context.env.DB.prepare(
+    `SELECT p.id,p.subject,p.topic,p.rationale,sp.target_examination_id AS examId,
     n.title,n.summary_markdown AS summary FROM study_plan_items p JOIN study_profiles sp ON sp.visitor_number=p.visitor_number
     LEFT JOIN notes n ON n.examination_id=sp.target_examination_id AND n.verification_status='published'
       AND (p.subject IS NULL OR n.subject=p.subject) AND (p.topic IS NULL OR n.topic=p.topic)
-    WHERE p.id=? AND p.visitor_number=? ORDER BY n.published_at DESC LIMIT 1`)
+    WHERE p.id=? AND p.visitor_number=? ORDER BY n.published_at DESC LIMIT 1`,
+  )
     .bind(context.req.param('id'), visitor.visitor_number)
-    .first<{ id: string; subject: string | null; topic: string | null; rationale: string; examId: string | null; title: string | null; summary: string | null }>();
+    .first<{
+      id: string;
+      subject: string | null;
+      topic: string | null;
+      rationale: string;
+      examId: string | null;
+      title: string | null;
+      summary: string | null;
+    }>();
   if (!item) return context.json({ error: 'Plan item not found.' }, 404);
-  await context.env.DB.prepare(`INSERT INTO study_task_learning (plan_item_id,state,updated_at) VALUES (?,'reading',?)
-    ON CONFLICT(plan_item_id) DO UPDATE SET state=CASE WHEN state='completed' THEN state ELSE 'reading' END,updated_at=excluded.updated_at`)
-    .bind(item.id, isoNow()).run();
+  await context.env.DB.prepare(
+    `INSERT INTO study_task_learning (plan_item_id,state,updated_at) VALUES (?,'reading',?)
+    ON CONFLICT(plan_item_id) DO UPDATE SET state=CASE WHEN state='completed' THEN state ELSE 'reading' END,updated_at=excluded.updated_at`,
+  )
+    .bind(item.id, isoNow())
+    .run();
   return context.json({
     state: 'reading',
     lesson: {
       title: item.title ?? `${item.topic ?? item.subject ?? 'Diagnostic foundations'} micro-lesson`,
-      body: item.summary ?? `Learning objective: ${item.rationale} Open the relevant concept, work through at least one example, and focus on why each step is valid before attempting the check.`,
+      body:
+        item.summary ??
+        `Learning objective: ${item.rationale} Open the relevant concept, work through at least one example, and focus on why each step is valid before attempting the check.`,
       sourceStatus: item.summary ? 'verified_note' : 'plan_micro_lesson',
     },
   });
 });
 
-routes.post('/api/study/plan/:id/engagement', zValidator('json', lessonEngagementSchema), async (context) => {
-  const input = context.req.valid('json');
-  const visitor = await visitorFor(context.env.DB, input.visitorUuid);
-  if (!visitor) return context.json({ error: 'Anonymous visitor not found.' }, 404);
-  const owned = await context.env.DB.prepare('SELECT 1 AS owned FROM study_plan_items WHERE id=? AND visitor_number=?').bind(context.req.param('id'), visitor.visitor_number).first();
-  if (!owned) return context.json({ error: 'Plan item not found.' }, 404);
-  const meaningful = input.visibleSeconds >= 10 && input.scrollPercent >= 50 && input.sectionsOpened >= 1;
-  await context.env.DB.prepare(`INSERT INTO study_task_learning
+routes.post(
+  '/api/study/plan/:id/engagement',
+  zValidator('json', lessonEngagementSchema),
+  async (context) => {
+    const input = context.req.valid('json');
+    const visitor = await visitorFor(context.env.DB, input.visitorUuid);
+    if (!visitor) return context.json({ error: 'Anonymous visitor not found.' }, 404);
+    const owned = await context.env.DB.prepare(
+      'SELECT 1 AS owned FROM study_plan_items WHERE id=? AND visitor_number=?',
+    )
+      .bind(context.req.param('id'), visitor.visitor_number)
+      .first();
+    if (!owned) return context.json({ error: 'Plan item not found.' }, 404);
+    const meaningful =
+      input.visibleSeconds >= 10 && input.scrollPercent >= 50 && input.sectionsOpened >= 1;
+    await context.env.DB.prepare(
+      `INSERT INTO study_task_learning
     (plan_item_id,state,engaged_seconds,max_scroll_percent,visible_seconds,sections_opened,examples_interacted,updated_at)
     VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(plan_item_id) DO UPDATE SET state=?,engaged_seconds=MAX(engaged_seconds,excluded.engaged_seconds),
       max_scroll_percent=MAX(max_scroll_percent,excluded.max_scroll_percent),visible_seconds=MAX(visible_seconds,excluded.visible_seconds),
-      sections_opened=MAX(sections_opened,excluded.sections_opened),examples_interacted=MAX(examples_interacted,excluded.examples_interacted),updated_at=excluded.updated_at`)
-    .bind(context.req.param('id'), meaningful ? 'check_required' : 'reading', input.engagedSeconds, input.scrollPercent, input.visibleSeconds, input.sectionsOpened, input.examplesInteracted, isoNow(), meaningful ? 'check_required' : 'reading').run();
-  return context.json({ state: meaningful ? 'check_required' : 'reading', message: meaningful ? 'Comprehension check unlocked.' : 'Continue engaging with the lesson before the check.' });
-});
+      sections_opened=MAX(sections_opened,excluded.sections_opened),examples_interacted=MAX(examples_interacted,excluded.examples_interacted),updated_at=excluded.updated_at`,
+    )
+      .bind(
+        context.req.param('id'),
+        meaningful ? 'check_required' : 'reading',
+        input.engagedSeconds,
+        input.scrollPercent,
+        input.visibleSeconds,
+        input.sectionsOpened,
+        input.examplesInteracted,
+        isoNow(),
+        meaningful ? 'check_required' : 'reading',
+      )
+      .run();
+    return context.json({
+      state: meaningful ? 'check_required' : 'reading',
+      message: meaningful
+        ? 'Comprehension check unlocked.'
+        : 'Continue engaging with the lesson before the check.',
+    });
+  },
+);
 
 routes.post('/api/study/plan/:id/checks', async (context) => {
   const body = z.object({ visitorUuid: z.uuid() }).safeParse(await context.req.json());
   if (!body.success) return context.json({ error: 'Valid anonymous visitor required.' }, 400);
   const visitor = await visitorFor(context.env.DB, body.data.visitorUuid);
   if (!visitor) return context.json({ error: 'Anonymous visitor not found.' }, 404);
-  const item = await context.env.DB.prepare(`SELECT p.subject,p.topic,sp.target_examination_id AS examId,l.state,
+  const item = await context.env.DB.prepare(
+    `SELECT p.subject,p.topic,sp.target_examination_id AS examId,l.state,
     COALESCE(l.check_attempts,0) AS attempts FROM study_plan_items p JOIN study_profiles sp ON sp.visitor_number=p.visitor_number
-    JOIN study_task_learning l ON l.plan_item_id=p.id WHERE p.id=? AND p.visitor_number=?`)
+    JOIN study_task_learning l ON l.plan_item_id=p.id WHERE p.id=? AND p.visitor_number=?`,
+  )
     .bind(context.req.param('id'), visitor.visitor_number)
-    .first<{ subject: string | null; topic: string | null; examId: string | null; state: string; attempts: number }>();
-  if (!item || !['check_required', 'retry_required'].includes(item.state)) return context.json({ error: 'Complete the lesson engagement step before starting a check.' }, 409);
-  const previousRows = await context.env.DB.prepare('SELECT question_ids_json AS ids FROM study_comprehension_attempts WHERE plan_item_id=?').bind(context.req.param('id')).all<{ ids: string }>();
+    .first<{
+      subject: string | null;
+      topic: string | null;
+      examId: string | null;
+      state: string;
+      attempts: number;
+    }>();
+  if (!item || !['check_required', 'retry_required'].includes(item.state))
+    return context.json(
+      { error: 'Complete the lesson engagement step before starting a check.' },
+      409,
+    );
+  const previousRows = await context.env.DB.prepare(
+    'SELECT question_ids_json AS ids FROM study_comprehension_attempts WHERE plan_item_id=?',
+  )
+    .bind(context.req.param('id'))
+    .all<{ ids: string }>();
   const excluded = new Set(previousRows.results.flatMap((row) => JSON.parse(row.ids) as string[]));
-  const { results: candidates } = await context.env.DB.prepare(`SELECT q.id,q.question_text AS questionText,q.subject,q.topic
+  const { results: candidates } = await context.env.DB.prepare(
+    `SELECT q.id,q.question_text AS questionText,q.subject,q.topic
     FROM questions q WHERE q.examination_id=? AND q.verification_status='published'
       AND (? IS NULL OR q.subject=?) AND (? IS NULL OR q.topic=?)
-    ORDER BY q.created_at DESC LIMIT 30`).bind(item.examId, item.subject, item.subject, item.topic, item.topic).all<{ id: string; questionText: string; subject: string; topic: string }>();
-  const selected = candidates.filter((question) => !excluded.has(question.id)).slice(0, Math.min(3, candidates.length));
-  if (selected.length < 2) return context.json({ error: 'Not enough different verified questions are available for this check. Reopen the lesson or choose focused AI practice.' }, 409);
-  const questions = await Promise.all(selected.map(async (question) => ({
-    ...question,
-    options: (await context.env.DB.prepare('SELECT option_index AS optionIndex,option_text AS optionText FROM question_options WHERE question_id=? ORDER BY option_index').bind(question.id).all()).results,
-  })));
+    ORDER BY q.created_at DESC LIMIT 30`,
+  )
+    .bind(item.examId, item.subject, item.subject, item.topic, item.topic)
+    .all<{ id: string; questionText: string; subject: string; topic: string }>();
+  const selected = candidates
+    .filter((question) => !excluded.has(question.id))
+    .slice(0, Math.min(3, candidates.length));
+  if (selected.length < 2)
+    return context.json(
+      {
+        error:
+          'Not enough different verified questions are available for this check. Reopen the lesson or choose focused AI practice.',
+      },
+      409,
+    );
+  const questions = await Promise.all(
+    selected.map(async (question) => ({
+      ...question,
+      options: (
+        await context.env.DB.prepare(
+          'SELECT option_index AS optionIndex,option_text AS optionText FROM question_options WHERE question_id=? ORDER BY option_index',
+        )
+          .bind(question.id)
+          .all()
+      ).results,
+    })),
+  );
   const checkId = crypto.randomUUID();
-  await context.env.DB.prepare(`INSERT INTO study_comprehension_attempts (id,plan_item_id,attempt_number,question_ids_json,created_at) VALUES (?,?,?,?,?)`)
-    .bind(checkId, context.req.param('id'), item.attempts + 1, JSON.stringify(selected.map((question) => question.id)), isoNow()).run();
+  await context.env.DB.prepare(
+    `INSERT INTO study_comprehension_attempts (id,plan_item_id,attempt_number,question_ids_json,created_at) VALUES (?,?,?,?,?)`,
+  )
+    .bind(
+      checkId,
+      context.req.param('id'),
+      item.attempts + 1,
+      JSON.stringify(selected.map((question) => question.id)),
+      isoNow(),
+    )
+    .run();
   return context.json({ checkId, passingPercent: 70, questions });
 });
 
-routes.post('/api/study/plan/:id/checks/submit', zValidator('json', comprehensionSubmitSchema), async (context) => {
-  const input = context.req.valid('json');
-  const visitor = await visitorFor(context.env.DB, input.visitorUuid);
-  if (!visitor) return context.json({ error: 'Anonymous visitor not found.' }, 404);
-  const check = await context.env.DB.prepare(`SELECT c.question_ids_json AS ids,c.submitted_at AS submittedAt FROM study_comprehension_attempts c
-    JOIN study_plan_items p ON p.id=c.plan_item_id WHERE c.id=? AND c.plan_item_id=? AND p.visitor_number=?`)
-    .bind(input.checkId, context.req.param('id'), visitor.visitor_number).first<{ ids: string; submittedAt: string | null }>();
-  if (!check || check.submittedAt) return context.json({ error: 'Comprehension check not found or already submitted.' }, 409);
-  const expected = JSON.parse(check.ids) as string[];
-  if (input.answers.length !== expected.length || input.answers.some((answer) => !expected.includes(answer.questionId))) return context.json({ error: 'Answers do not match this check.' }, 400);
-  const feedback = await Promise.all(input.answers.map(async (answer) => {
-    const key = await context.env.DB.prepare(`SELECT k.correct_option_index AS correctOptionIndex,k.explanation FROM answer_key_versions k
-      WHERE k.question_id=? AND k.is_current=1 ORDER BY k.created_at DESC LIMIT 1`).bind(answer.questionId).first<{ correctOptionIndex: number; explanation: string | null }>();
-    return { questionId: answer.questionId, correct: answer.selectedOptionIndex === key?.correctOptionIndex, correctOptionIndex: key?.correctOptionIndex, explanation: key?.explanation ?? 'Review the verified lesson and solution.' };
-  }));
-  const correct = feedback.filter((item) => item.correct).length;
-  const scorePercent = Math.round((correct / feedback.length) * 100);
-  const passed = scorePercent >= 70;
-  const timestamp = isoNow();
-  const statements = [
-    context.env.DB.prepare('UPDATE study_comprehension_attempts SET answers_json=?,score_percent=?,passed=?,submitted_at=? WHERE id=?').bind(JSON.stringify(input.answers), scorePercent, passed ? 1 : 0, timestamp, input.checkId),
-    context.env.DB.prepare(`UPDATE study_task_learning SET state=?,check_attempts=check_attempts+1,correct_answers=correct_answers+?,total_answers=total_answers+?,completed_at=?,updated_at=? WHERE plan_item_id=?`).bind(passed ? 'completed' : 'retry_required', correct, feedback.length, passed ? timestamp : null, timestamp, context.req.param('id')),
-  ];
-  if (passed) {
-    statements.push(
-      context.env.DB.prepare(`UPDATE study_plan_items SET status='completed',completed_at=? WHERE id=?`).bind(timestamp, context.req.param('id')),
-      ...[1, 3, 7, 15].map((days) => context.env.DB.prepare(`INSERT INTO study_revisions (id,plan_item_id,due_at,interval_days,status) VALUES (?,?,datetime(?, '+' || ? || ' days'),?,'scheduled')`).bind(crypto.randomUUID(), context.req.param('id'), timestamp, days, days)),
-      context.env.DB.prepare(`UPDATE study_profiles SET current_streak=CASE WHEN last_study_date=date(?,'-1 day') THEN current_streak+1 WHEN last_study_date=date(?) THEN current_streak ELSE 1 END,last_study_date=date(?),updated_at=? WHERE visitor_number=?`).bind(timestamp, timestamp, timestamp, timestamp, visitor.visitor_number),
+routes.post(
+  '/api/study/plan/:id/checks/submit',
+  zValidator('json', comprehensionSubmitSchema),
+  async (context) => {
+    const input = context.req.valid('json');
+    const visitor = await visitorFor(context.env.DB, input.visitorUuid);
+    if (!visitor) return context.json({ error: 'Anonymous visitor not found.' }, 404);
+    const check = await context.env.DB.prepare(
+      `SELECT c.question_ids_json AS ids,c.submitted_at AS submittedAt FROM study_comprehension_attempts c
+    JOIN study_plan_items p ON p.id=c.plan_item_id WHERE c.id=? AND c.plan_item_id=? AND p.visitor_number=?`,
+    )
+      .bind(input.checkId, context.req.param('id'), visitor.visitor_number)
+      .first<{ ids: string; submittedAt: string | null }>();
+    if (!check || check.submittedAt)
+      return context.json({ error: 'Comprehension check not found or already submitted.' }, 409);
+    const expected = JSON.parse(check.ids) as string[];
+    if (
+      input.answers.length !== expected.length ||
+      input.answers.some((answer) => !expected.includes(answer.questionId))
+    )
+      return context.json({ error: 'Answers do not match this check.' }, 400);
+    const feedback = await Promise.all(
+      input.answers.map(async (answer) => {
+        const key = await context.env.DB.prepare(
+          `SELECT k.correct_option_index AS correctOptionIndex,k.explanation FROM answer_key_versions k
+      WHERE k.question_id=? AND k.is_current=1 ORDER BY k.created_at DESC LIMIT 1`,
+        )
+          .bind(answer.questionId)
+          .first<{ correctOptionIndex: number; explanation: string | null }>();
+        return {
+          questionId: answer.questionId,
+          correct: answer.selectedOptionIndex === key?.correctOptionIndex,
+          correctOptionIndex: key?.correctOptionIndex,
+          explanation: key?.explanation ?? 'Review the verified lesson and solution.',
+        };
+      }),
     );
-  }
-  await context.env.DB.batch(statements);
-  return context.json({ passed, scorePercent, state: passed ? 'completed' : 'retry_required', feedback, nextAction: passed ? 'Revisions scheduled for 1, 3, 7 and 15 days.' : 'Reopen the lesson, review a simpler explanation, then try a different check.' });
-});
+    const correct = feedback.filter((item) => item.correct).length;
+    const scorePercent = Math.round((correct / feedback.length) * 100);
+    const passed = scorePercent >= 70;
+    const timestamp = isoNow();
+    const statements = [
+      context.env.DB.prepare(
+        'UPDATE study_comprehension_attempts SET answers_json=?,score_percent=?,passed=?,submitted_at=? WHERE id=?',
+      ).bind(JSON.stringify(input.answers), scorePercent, passed ? 1 : 0, timestamp, input.checkId),
+      context.env.DB.prepare(
+        `UPDATE study_task_learning SET state=?,check_attempts=check_attempts+1,correct_answers=correct_answers+?,total_answers=total_answers+?,completed_at=?,updated_at=? WHERE plan_item_id=?`,
+      ).bind(
+        passed ? 'completed' : 'retry_required',
+        correct,
+        feedback.length,
+        passed ? timestamp : null,
+        timestamp,
+        context.req.param('id'),
+      ),
+    ];
+    if (passed) {
+      statements.push(
+        context.env.DB.prepare(
+          `UPDATE study_plan_items SET status='completed',completed_at=? WHERE id=?`,
+        ).bind(timestamp, context.req.param('id')),
+        ...[1, 3, 7, 15].map((days) =>
+          context.env.DB.prepare(
+            `INSERT INTO study_revisions (id,plan_item_id,due_at,interval_days,status) VALUES (?,?,datetime(?, '+' || ? || ' days'),?,'scheduled')`,
+          ).bind(crypto.randomUUID(), context.req.param('id'), timestamp, days, days),
+        ),
+        context.env.DB.prepare(
+          `UPDATE study_profiles SET current_streak=CASE WHEN last_study_date=date(?,'-1 day') THEN current_streak+1 WHEN last_study_date=date(?) THEN current_streak ELSE 1 END,last_study_date=date(?),updated_at=? WHERE visitor_number=?`,
+        ).bind(timestamp, timestamp, timestamp, timestamp, visitor.visitor_number),
+      );
+    }
+    await context.env.DB.batch(statements);
+    return context.json({
+      passed,
+      scorePercent,
+      state: passed ? 'completed' : 'retry_required',
+      feedback,
+      nextAction: passed
+        ? 'Revisions scheduled for 1, 3, 7 and 15 days.'
+        : 'Reopen the lesson, review a simpler explanation, then try a different check.',
+    });
+  },
+);
 
 routes.put(
   '/api/study/mistakes/:questionId',

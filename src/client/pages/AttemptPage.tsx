@@ -29,6 +29,7 @@ interface AttemptQuestion {
   positiveMarks: number;
   negativeMarks: number;
   questionText: string;
+  contentOrigin?: string;
   selectedOptionIndex: number | null;
   markedForReview: number | boolean;
   visited: number | boolean;
@@ -800,6 +801,9 @@ export function AttemptPage() {
             <span>
               +{question.positiveMarks} / −{question.negativeMarks}
             </span>
+            {question.contentOrigin === 'ai_generated_practice' && (
+              <span>AI-generated and verified practice question</span>
+            )}
           </div>
           <h1>{question.questionText}</h1>
           <fieldset>

@@ -14,11 +14,17 @@ const runtimeVariablesSchema = z
     ATTEMPT_SIGNING_SECRET: z.string().min(32).optional(),
     GROQ_ENABLED: z.enum(['off', 'on']).default('off'),
     GROQ_MODEL: z.string().min(3).max(120).default('llama-3.3-70b-versatile'),
+    GROQ_VERIFICATION_MODEL: z.string().min(3).max(120).default('openai/gpt-oss-20b'),
     GROQ_API_KEY: z.string().min(20).optional(),
     AI_GENERATION_ENABLED: z.enum(['off', 'on']).default('on'),
     AI_VISITOR_DAILY_LIMIT: z.coerce.number().int().min(1).max(100).default(5),
     AI_GLOBAL_DAILY_REQUEST_LIMIT: z.coerce.number().int().min(1).max(100000).default(500),
-    AI_GLOBAL_DAILY_TOKEN_LIMIT: z.coerce.number().int().min(1000).max(100000000).default(2_000_000),
+    AI_GLOBAL_DAILY_TOKEN_LIMIT: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(100000000)
+      .default(2_000_000),
   })
   .superRefine((value, context) => {
     if (value.TURNSTILE_MODE === 'enforced' && !value.TURNSTILE_SECRET_KEY) {

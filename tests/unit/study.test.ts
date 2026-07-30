@@ -1,4 +1,10 @@
-import { buildDailyPlan, nextRevision, planItemUpdateSchema, studyCompletionPercent, type MasteryEvidence } from '@shared/study';
+import {
+  buildDailyPlan,
+  nextRevision,
+  planItemUpdateSchema,
+  studyCompletionPercent,
+  type MasteryEvidence,
+} from '@shared/study';
 import { describe, expect, it } from 'vitest';
 
 const evidence: MasteryEvidence[] = [
@@ -66,10 +72,12 @@ describe('Phase 5 adaptive preparation', () => {
 
 describe('comprehension-gated study progress', () => {
   it('rejects direct completion updates', () => {
-    expect(planItemUpdateSchema.safeParse({
-      visitorUuid: '77a0fb6a-44d5-41ea-8d30-e9748995c9f9',
-      status: 'completed',
-    }).success).toBe(false);
+    expect(
+      planItemUpdateSchema.safeParse({
+        visitorUuid: '77a0fb6a-44d5-41ea-8d30-e9748995c9f9',
+        status: 'completed',
+      }).success,
+    ).toBe(false);
   });
 
   it('excludes skipped tasks from completion percentage', () => {

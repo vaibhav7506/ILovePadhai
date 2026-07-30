@@ -12,15 +12,32 @@ test.afterEach(async ({ page, request }) => {
 
 test('renders the examination desk without account UI', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: /Prepare from what is verified/i })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /Practise a fresh test/i })).toBeVisible();
   await expect(page.getByRole('heading', { name: '10th–12th level' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Graduation level' })).toBeVisible();
-  await expect(page.getByText('Content under verification').first()).toBeVisible();
+  await expect(
+    page.getByRole('link', { name: 'Start AI test', exact: true }).first(),
+  ).toBeVisible();
   await expect(page.getByText(/anonymous learners? (has|have) visited/).first()).toBeVisible();
   await expect(page.getByRole('link', { name: /sign in|sign up/i })).toHaveCount(0);
 });
 
-test('anonymous identity persists without incrementing on reload', async ({ page }) => {
+test('anonymous identity persists without incrementing on reload', async ({ page, request }) => {
+  const visitorUuid = crypto.randomUUID();
+  const registration = await request.post('/api/visitors/register', {
+    data: {
+      visitorUuid,
+      sessionUuid: crypto.randomUUID(),
+      landingPath: '/',
+      deviceCategory: 'desktop',
+      referrerCategory: 'direct',
+    },
+  });
+  expect(registration.ok()).toBe(true);
+  await page.addInitScript((registeredVisitorUuid) => {
+    localStorage.setItem('examforge.visitor_uuid', registeredVisitorUuid);
+  }, visitorUuid);
+
   await page.goto('/');
   const footfall = page.getByText(/You’re learner #/);
   await expect(footfall).toBeVisible();

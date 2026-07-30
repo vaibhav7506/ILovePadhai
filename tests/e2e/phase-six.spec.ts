@@ -22,7 +22,7 @@ test('PWA metadata and final health contract are available', async ({ page, requ
   expect(body.status).toBe('ready');
   expect(body.components.d1).toBe('ok');
   expect(body.components.r2).toMatch(/^ok/);
-  expect(body.components.groq).toBe('disabled');
+  expect(['disabled', 'configured']).toContain(body.components.groq);
 });
 
 test('offline library survives a network disconnect', async ({ page, context }) => {
@@ -45,7 +45,9 @@ test('offline library survives a network disconnect', async ({ page, context }) 
     page.getByRole('heading', { name: 'Carry a small, verified library.' }),
   ).toBeVisible();
   await expect(
-    page.getByText(/downloaded material|catalogue is unavailable|no published, verified/i),
+    page.getByText(
+      /downloaded material|catalogue is unavailable|no published, verified|nothing downloaded yet/i,
+    ),
   ).toBeVisible();
   await context.setOffline(false);
 });

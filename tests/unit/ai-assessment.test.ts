@@ -1,7 +1,21 @@
 import {
-  aiExamConfigurations, aiTestRequestSchema, buildGenerationPrompt,
-  deterministicArithmeticAnswer, deterministicQuestionIssues, generatedBatchSchema,
-  optionIndependentText, tokenSimilarity, type GeneratedQuestion,
+  aiExamConfigurations,
+  aiTestRequestSchema,
+  buildGenerationPrompt,
+  compactVerificationPayload,
+  deterministicArithmeticAnswer,
+  deterministicQuestionIssues,
+  generatedBatchSchema,
+  groqMaxTokens,
+  groqModelForStage,
+  parseGenerationContent,
+  parseRetryAfterSeconds,
+  parseVerificationContent,
+  requireVerificationCoverage,
+  shouldAutomaticallyRetry,
+  optionIndependentText,
+  tokenSimilarity,
+  type GeneratedQuestion,
 } from '@shared/ai-assessment';
 import { describe, expect, it } from 'vitest';
 
@@ -25,19 +39,36 @@ describe('AI assessment architecture', () => {
 
   it('validates exactly four options and a 10-question configuration', () => {
     expect(generatedBatchSchema.parse({ questions: [question] }).questions).toHaveLength(1);
-    expect(() => generatedBatchSchema.parse({ questions: [{ ...question, options: ['1', '2', '3'] }] })).toThrow();
-    expect(aiTestRequestSchema.parse({
-      visitorUuid: '77a0fb6a-44d5-41ea-8d30-e9748995c9f9',
-      examinationSlug: 'ssc-chsl', tierStage: 'Tier I', subject: 'Quantitative Aptitude',
-      topic: null, difficulty: 'medium', questionCount: 10, fullMock: false,
-      language: 'en', timerMode: 'custom', customDurationMinutes: 10,
-    }).questionCount).toBe(10);
+    expect(() =>
+      generatedBatchSchema.parse({ questions: [{ ...question, options: ['1', '2', '3'] }] }),
+    ).toThrow();
+    expect(
+      aiTestRequestSchema.parse({
+        visitorUuid: '77a0fb6a-44d5-41ea-8d30-e9748995c9f9',
+        examinationSlug: 'ssc-chsl',
+        tierStage: 'Tier I',
+        subject: 'Quantitative Aptitude',
+        topic: null,
+        difficulty: 'medium',
+        questionCount: 10,
+        fullMock: false,
+        language: 'en',
+        timerMode: 'custom',
+        customDurationMinutes: 10,
+      }).questionCount,
+    ).toBe(10);
   });
 
   it('detects duplicate options, reordered copies, and similar text', () => {
-    expect(deterministicQuestionIssues({ ...question, options: ['20', '20!', '19', '18'] })).toContain('Options must be meaningfully distinct.');
-    expect(optionIndependentText(question)).toBe(optionIndependentText({ ...question, options: [...question.options].reverse() }));
-    expect(tokenSimilarity(question.question, 'Using the standard addition rule, calculate 12 + 8.')).toBeGreaterThan(0.5);
+    expect(
+      deterministicQuestionIssues({ ...question, options: ['20', '20!', '19', '18'] }),
+    ).toContain('Options must be meaningfully distinct.');
+    expect(optionIndependentText(question)).toBe(
+      optionIndependentText({ ...question, options: [...question.options].reverse() }),
+    );
+    expect(
+      tokenSimilarity(question.question, 'Using the standard addition rule, calculate 12 + 8.'),
+    ).toBeGreaterThan(0.5);
   });
 
   it('checks simple arithmetic deterministically', () => {
@@ -46,16 +77,137 @@ describe('AI assessment architecture', () => {
   });
 
   it('uses exam-specific constraints and exclusions', () => {
-    const config = aiExamConfigurations.find((item) => item.slug === 'ssc-chsl')!;
+    const config = aiExamConfigurations.find((item) => item.slug === 'ssc-chsl');
+    expect(config).toBeDefined();
+    if (!config) throw new Error('SSC CHSL configuration missing.');
     const input = aiTestRequestSchema.parse({
       visitorUuid: '77a0fb6a-44d5-41ea-8d30-e9748995c9f9',
-      examinationSlug: 'ssc-chsl', tierStage: 'Tier I', subject: 'Quantitative Aptitude',
-      topic: 'Percentages', difficulty: 'medium', questionCount: 10, fullMock: false,
-      language: 'en', timerMode: 'custom', customDurationMinutes: 10,
+      examinationSlug: 'ssc-chsl',
+      tierStage: 'Tier I',
+      subject: 'Quantitative Aptitude',
+      topic: 'Percentages',
+      difficulty: 'medium',
+      questionCount: 10,
+      fullMock: false,
+      language: 'en',
+      timerMode: 'custom',
+      customDurationMinutes: 10,
     });
     const prompt = buildGenerationPrompt(config, input, 10, ['seen-fingerprint'], 'seed');
-    expect(prompt).toContain('PROMPT_VERSION=ssc-chsl-v1');
-    expect(prompt).toContain('Required count: 10');
+    expect(prompt).toContain('VERSION=ssc-chsl-v1');
+    expect(prompt).toContain('COUNT=10');
     expect(prompt).toContain('seen-fingerprint');
+  });
+});
+
+describe('Groq response parsing', () => {
+  const verification = {
+    questionId: 'question-stable-1',
+    status: 'verified' as const,
+    confidence: 0.95,
+    correctedOptionIndex: null,
+    rejectionReason: null,
+  };
+
+  it('accepts the canonical verification results object', () => {
+    expect(parseVerificationContent(JSON.stringify({ results: [verification] })).results).toEqual([
+      verification,
+    ]);
+  });
+
+  it('normalises a bare verification array', () => {
+    expect(parseVerificationContent(JSON.stringify([verification])).results).toEqual([
+      verification,
+    ]);
+  });
+
+  it('normalises the known verifications wrapper', () => {
+    expect(
+      parseVerificationContent(JSON.stringify({ verifications: [verification] })).results,
+    ).toEqual([verification]);
+  });
+
+  it('removes Markdown JSON fences before validation', () => {
+    expect(
+      parseVerificationContent(`\`\`\`json\n${JSON.stringify({ results: [verification] })}\n\`\`\``)
+        .results,
+    ).toHaveLength(1);
+  });
+
+  it('rejects missing results and invalid JSON', () => {
+    expect(() => parseVerificationContent('{"answer":"verified"}')).toThrow();
+    expect(() => parseVerificationContent('not json')).toThrow(
+      'AI response content was not valid JSON.',
+    );
+  });
+
+  it('rejects verification count or stable-ID mismatches', () => {
+    const batch = parseVerificationContent(JSON.stringify({ results: [verification] }));
+    expect(() =>
+      requireVerificationCoverage(batch, ['question-stable-1', 'question-stable-2']),
+    ).toThrow('Verification result count does not match');
+    expect(() => requireVerificationCoverage(batch, ['different-id'])).toThrow(
+      'Verification result IDs do not match',
+    );
+  });
+
+  it('parses an exact five-question generation response', () => {
+    const questions = Array.from({ length: 5 }, (_, index) => ({
+      ...question,
+      question: `Calculate 12 + ${String(index + 8)} using the standard addition rule.`,
+    }));
+    expect(parseGenerationContent(JSON.stringify({ questions })).questions).toHaveLength(5);
+  });
+});
+
+describe('Groq rate-limit architecture', () => {
+  it('uses separate generation and verification models', () => {
+    expect(groqModelForStage('generation', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b')).toBe(
+      'llama-3.3-70b-versatile',
+    );
+    expect(groqModelForStage('verification', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b')).toBe(
+      'openai/gpt-oss-20b',
+    );
+  });
+
+  it('builds a compact verification payload without visitor or product data', () => {
+    const payload = compactVerificationPayload([{ questionId: 'stable-question', question }]);
+    expect(Object.keys(payload.questions[0] ?? {})).toEqual([
+      'questionId',
+      'question',
+      'options',
+      'proposedAnswer',
+      'topic',
+      'explanation',
+    ]);
+    expect(JSON.stringify(payload)).not.toMatch(
+      /visitor|leaderboard|cutoff|ExamForge|correctOptionIndex/i,
+    );
+  });
+
+  it('parses numeric and HTTP-date retry-after headers', () => {
+    expect(parseRetryAfterSeconds('2.2')).toBe(3);
+    expect(
+      parseRetryAfterSeconds(
+        'Thu, 30 Jul 2026 12:00:05 GMT',
+        Date.parse('Thu, 30 Jul 2026 12:00:00 GMT'),
+      ),
+    ).toBe(5);
+    expect(parseRetryAfterSeconds(null)).toBe(60);
+  });
+
+  it('exposes cooldown eligibility for one automatic retry', () => {
+    const elapsed = new Date(Date.now() - 1_000).toISOString();
+    const future = new Date(Date.now() + 30_000).toISOString();
+    expect(shouldAutomaticallyRetry(elapsed, false)).toBe(true);
+    expect(shouldAutomaticallyRetry(elapsed, true)).toBe(false);
+    expect(shouldAutomaticallyRetry(future, false)).toBe(false);
+  });
+
+  it('always bounds provider output tokens by stage and question count', () => {
+    expect(groqMaxTokens('generation', 5)).toBe(2_400);
+    expect(groqMaxTokens('verification', 5)).toBe(710);
+    expect(groqMaxTokens('generation', 200)).toBe(6_000);
+    expect(groqMaxTokens('verification', 200)).toBe(2_400);
   });
 });

@@ -36,9 +36,17 @@ export const planItemUpdateSchema = z.object({
 
 export const lessonEngagementSchema = z.object({
   visitorUuid: z.uuid(),
-  engagedSeconds: z.number().int().min(0).max(24 * 60 * 60),
+  engagedSeconds: z
+    .number()
+    .int()
+    .min(0)
+    .max(24 * 60 * 60),
   scrollPercent: z.number().int().min(0).max(100),
-  visibleSeconds: z.number().int().min(0).max(24 * 60 * 60),
+  visibleSeconds: z
+    .number()
+    .int()
+    .min(0)
+    .max(24 * 60 * 60),
   sectionsOpened: z.number().int().min(0).max(100),
   examplesInteracted: z.number().int().min(0).max(100),
 });
@@ -46,13 +54,22 @@ export const lessonEngagementSchema = z.object({
 export const comprehensionSubmitSchema = z.object({
   visitorUuid: z.uuid(),
   checkId: z.uuid(),
-  answers: z.array(z.object({
-    questionId: z.string().min(1).max(120),
-    selectedOptionIndex: z.number().int().min(0).max(3).nullable(),
-  })).min(2).max(5),
+  answers: z
+    .array(
+      z.object({
+        questionId: z.string().min(1).max(120),
+        selectedOptionIndex: z.number().int().min(0).max(3).nullable(),
+      }),
+    )
+    .min(2)
+    .max(5),
 });
 
-export function studyCompletionPercent(completed: number, retryRequired: number, planned: number): number {
+export function studyCompletionPercent(
+  completed: number,
+  retryRequired: number,
+  planned: number,
+): number {
   const eligible = completed + retryRequired + planned;
   return eligible === 0 ? 0 : Math.round((completed / eligible) * 100);
 }

@@ -33,7 +33,8 @@ export interface AttemptRow {
   region: string | null;
   post_name: string | null;
   stage_name: string | null;
-  generation_status?: 'pending' | 'preparing' | 'generating' | 'deduplicating' | 'verifying' | 'ready' | 'failed';
+  generation_status?:
+    'pending' | 'preparing' | 'generating' | 'deduplicating' | 'verifying' | 'ready' | 'failed';
 }
 
 // Phase 3 attempt lifecycle plus the additive Phase 4 analysis routes.
@@ -512,7 +513,7 @@ routes.get('/api/attempts/:id', async (context) => {
   const { results: questions } = await context.env.DB.prepare(
     `SELECT aq.question_id AS id, aq.position, aq.section, aq.topic,
             aq.positive_marks AS positiveMarks, aq.negative_marks AS negativeMarks,
-            q.question_text AS questionText, q.language,
+            q.question_text AS questionText, q.language, q.content_origin AS contentOrigin,
             r.selected_option_index AS selectedOptionIndex,
             r.marked_for_review AS markedForReview, r.visited,
             r.client_revision AS clientRevision,

@@ -158,7 +158,10 @@ export function HomePage() {
                 : 'Attempts will be saved to this browser when verified papers become available.'}
             </p>
           </div>
-          <Link className="primary-button" to={previousAttempt ? `/attempts/${previousAttempt}` : '/practice'}>
+          <Link
+            className="primary-button"
+            to={previousAttempt ? `/attempts/${previousAttempt}` : '/practice'}
+          >
             {previousAttempt ? 'Continue attempt' : 'No attempt yet'}
             <ArrowRight size={17} />
           </Link>
