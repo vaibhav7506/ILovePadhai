@@ -15,6 +15,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { useVisitor } from '../visitor-context';
+import { TurnstileWidget, turnstileEnabled } from '../TurnstileWidget';
 
 interface Option {
   optionIndex: number;
@@ -181,6 +182,8 @@ export function AttemptPage() {
     aiGenerated?: boolean | undefined;
   }>();
   const [askingDoubt, setAskingDoubt] = useState(false);
+  const [doubtTurnstileToken, setDoubtTurnstileToken] = useState<string>();
+  const [doubtTurnstileReset, setDoubtTurnstileReset] = useState(0);
   const submitting = useRef(false);
 
   const load = useCallback(async () => {
@@ -676,6 +679,8 @@ export function AttemptPage() {
                       setDoubtQuestion(doubtQuestion === result.id ? undefined : result.id);
                       setDoubtAnswer(undefined);
                       setDoubtText('');
+                      setDoubtTurnstileToken(undefined);
+                      setDoubtTurnstileReset((value) => value + 1);
                     }}
                     type="button"
                   >
@@ -697,8 +702,20 @@ export function AttemptPage() {
                         value={doubtText}
                       />
                     </label>
+                    {turnstileEnabled && (
+                      <TurnstileWidget
+                        action="doubt"
+                        onToken={setDoubtTurnstileToken}
+                        resetKey={doubtTurnstileReset}
+                      />
+                    )}
                     <button
-                      disabled={!visitorUuid || doubtText.trim().length < 3 || askingDoubt}
+                      disabled={
+                        !visitorUuid ||
+                        doubtText.trim().length < 3 ||
+                        askingDoubt ||
+                        (turnstileEnabled && !doubtTurnstileToken)
+                      }
                       onClick={() => {
                         if (!visitorUuid) return;
                         setAskingDoubt(true);
@@ -709,6 +726,7 @@ export function AttemptPage() {
                             visitorUuid,
                             questionId: result.id,
                             question: doubtText,
+                            ...(doubtTurnstileToken ? { turnstileToken: doubtTurnstileToken } : {}),
                           }),
                         })
                           .then(async (response) => {
@@ -736,6 +754,8 @@ export function AttemptPage() {
                           })
                           .finally(() => {
                             setAskingDoubt(false);
+                            setDoubtTurnstileToken(undefined);
+                            setDoubtTurnstileReset((value) => value + 1);
                           });
                       }}
                       type="button"

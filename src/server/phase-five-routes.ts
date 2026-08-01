@@ -1,4 +1,5 @@
 import { zValidator } from '@hono/zod-validator';
+import { parseRetryAfterSeconds } from '@shared/ai-assessment';
 import {
   buildDailyPlan,
   doubtRequestSchema,
@@ -14,6 +15,11 @@ import {
 } from '@shared/study';
 import { z } from 'zod';
 import { Hono } from 'hono';
+import {
+  acquireProviderGate,
+  recordProviderCooldown,
+  releaseProviderGate,
+} from './ai-assessment-routes';
 import { validateRuntimeEnvironment } from './env';
 import { verifyTurnstile } from './turnstile';
 
@@ -786,17 +792,14 @@ routes.post('/api/doubts', zValidator('json', doubtRequestSchema), async (contex
   const cached = await context.env.PUBLIC_CACHE.get(cacheKey, 'json');
   if (cached) return context.json(cached);
 
-  const enabled: unknown = Reflect.get(context.env, 'GROQ_ENABLED');
-  const apiKey: unknown = Reflect.get(context.env, 'GROQ_API_KEY');
-  const modelValue: unknown = Reflect.get(context.env, 'GROQ_MODEL');
-  const model = typeof modelValue === 'string' ? modelValue : 'llama-3.3-70b-versatile';
+  const { GROQ_ENABLED: enabled, GROQ_API_KEY: apiKey, GROQ_MODEL: model } = variables;
   const fallback = {
     status: 'verified_fallback',
     answer: grounding.explanation ?? grounding.noteSummary,
     sources: [{ title: 'Verified source material', url: grounding.sourceUrl }],
     aiGenerated: false,
   };
-  if (enabled !== 'on' || typeof apiKey !== 'string' || apiKey.length < 20) {
+  if (enabled !== 'on' || !apiKey) {
     await context.env.DB.prepare(
       `INSERT INTO ai_usage_logs (id, visitor_number, feature, status, created_at)
          VALUES (?, ?, 'grounded_doubt', 'fallback', ?)`,
@@ -806,11 +809,27 @@ routes.post('/api/doubts', zValidator('json', doubtRequestSchema), async (contex
     return context.json(fallback);
   }
 
+  const modelCooldown = await context.env.DB.prepare(
+    `SELECT cooldown_until FROM ai_provider_model_cooldowns
+      WHERE model=? AND cooldown_until>?`,
+  )
+    .bind(model, isoNow())
+    .first<{ cooldown_until: string }>();
+  if (modelCooldown) return context.json(fallback);
+
   const controller = new AbortController();
   const timeout = setTimeout(() => {
     controller.abort();
   }, 8_000);
+  let providerLock: string | null = null;
   try {
+    providerLock = await acquireProviderGate(
+      context.env.DB,
+      `doubt:${String(visitor.visitor_number)}:${input.questionId}`,
+      model,
+      'verification',
+      variables.AI_PROVIDER_MIN_INTERVAL_MS,
+    );
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -832,8 +851,40 @@ routes.post('/api/doubts', zValidator('json', doubtRequestSchema), async (contex
       }),
       signal: controller.signal,
     });
-    if (!response.ok) throw new Error(`Groq returned ${String(response.status)}.`);
+    if (response.status === 429) {
+      const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get('retry-after'));
+      await recordProviderCooldown(context.env.DB, model, retryAfterSeconds, response.status);
+    }
+    if (!response.ok) {
+      console.log(
+        JSON.stringify({
+          event: 'ai_provider_request',
+          attemptId: `doubt:${input.questionId}`,
+          stage: 'grounded_doubt',
+          model,
+          inputTokens: 0,
+          outputTokens: 0,
+          batchSize: 1,
+          responseStatus: response.status,
+          fallbackDecision: 'primary',
+        }),
+      );
+      throw new Error(`Groq returned ${String(response.status)}.`);
+    }
     const parsed = groqResponseSchema.parse(await response.json());
+    console.log(
+      JSON.stringify({
+        event: 'ai_provider_request',
+        attemptId: `doubt:${input.questionId}`,
+        stage: 'grounded_doubt',
+        model,
+        inputTokens: parsed.usage?.prompt_tokens ?? 0,
+        outputTokens: parsed.usage?.completion_tokens ?? 0,
+        batchSize: 1,
+        responseStatus: response.status,
+        fallbackDecision: 'primary',
+      }),
+    );
     const result = {
       status: 'answered',
       answer: parsed.choices[0]?.message.content ?? fallback.answer,
@@ -869,6 +920,12 @@ routes.post('/api/doubts', zValidator('json', doubtRequestSchema), async (contex
     return context.json(fallback);
   } finally {
     clearTimeout(timeout);
+    if (providerLock)
+      await releaseProviderGate(
+        context.env.DB,
+        providerLock,
+        variables.AI_PROVIDER_MIN_INTERVAL_MS,
+      );
   }
 });
 

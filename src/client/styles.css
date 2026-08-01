@@ -2582,6 +2582,29 @@ h3 {
   font-weight: 700;
 }
 
+.turnstile-widget {
+  min-height: 65px;
+  margin: 14px 0;
+}
+
+.turnstile-gate {
+  position: fixed;
+  z-index: 1000;
+  right: 18px;
+  bottom: 18px;
+  display: grid;
+  max-width: 360px;
+  border: 1px solid var(--divider);
+  padding: 16px 18px;
+  background: var(--white);
+  box-shadow: 0 12px 35px rgb(20 25 34 / 16%);
+}
+
+.turnstile-gate span {
+  color: var(--slate);
+  font-size: 0.85rem;
+}
+
 @media (max-width: 1000px) {
   .study-settings {
     grid-template-columns: 1fr 1fr;

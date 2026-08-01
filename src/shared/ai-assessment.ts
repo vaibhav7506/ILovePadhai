@@ -191,14 +191,22 @@ export const generatedQuestionSchema = z
     question: z.string().trim().min(12).max(1200),
     options: z.array(z.string().trim().min(1).max(500)).length(4),
     correctOptionIndex: z.number().int().min(0).max(3),
-    explanation: z.string().trim().min(8).max(1000),
+    explanation: z.string().trim().min(8).max(500),
     subject: z.string().trim().min(1).max(120),
     topic: z.string().trim().min(1).max(120),
     difficulty: z.enum(['easy', 'medium', 'hard']),
     language: z.enum(aiLanguages),
     verificationMethod: z.literal('model_review'),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.explanation.split(/\s+/u).filter(Boolean).length > 40)
+      context.addIssue({
+        code: 'custom',
+        path: ['explanation'],
+        message: 'Explanation must not exceed 40 words.',
+      });
+  });
 export const generatedBatchSchema = z
   .object({
     questions: z.array(generatedQuestionSchema).min(1).max(200),
@@ -222,8 +230,64 @@ export type AiTestRequest = z.infer<typeof aiTestRequestSchema>;
 export type GeneratedQuestion = z.infer<typeof generatedQuestionSchema>;
 export type VerificationBatch = z.infer<typeof verificationBatchSchema>;
 
+export const generationRunStates = [
+  'pending',
+  'generating',
+  'verification_pending',
+  'verifying',
+  'rate_limited',
+  'retryable',
+  'ready',
+  'completed',
+  'cancelled',
+  'expired',
+  'invalid',
+] as const;
+export type GenerationRunStateName = (typeof generationRunStates)[number];
+export type GenerationWorkStage = 'generation' | 'verification';
+
+export type GenerationDecision =
+  | { action: 'run'; stage: GenerationWorkStage }
+  | { action: 'already_running'; retryAfterSeconds: number }
+  | { action: 'rate_limited'; stage: GenerationWorkStage; retryAfterSeconds: number }
+  | { action: 'ready' }
+  | { action: 'terminal'; errorCode: 'ATTEMPT_CANCELLED' | 'ATTEMPT_EXPIRED' | 'ATTEMPT_INVALID' };
+
+export function decideGenerationAction(
+  input: {
+    state: GenerationRunStateName;
+    failedStage: GenerationWorkStage | null;
+    cooldownUntil: string | null;
+    lockExpiresAt: string | null;
+  },
+  nowMilliseconds = Date.now(),
+): GenerationDecision {
+  const lockExpiry = Date.parse(input.lockExpiresAt ?? '');
+  if (Number.isFinite(lockExpiry) && lockExpiry > nowMilliseconds)
+    return {
+      action: 'already_running',
+      retryAfterSeconds: Math.max(1, Math.ceil((lockExpiry - nowMilliseconds) / 1_000)),
+    };
+  if (input.state === 'ready' || input.state === 'completed') return { action: 'ready' };
+  if (input.state === 'cancelled') return { action: 'terminal', errorCode: 'ATTEMPT_CANCELLED' };
+  if (input.state === 'expired') return { action: 'terminal', errorCode: 'ATTEMPT_EXPIRED' };
+  if (input.state === 'invalid') return { action: 'terminal', errorCode: 'ATTEMPT_INVALID' };
+  const stage =
+    input.state === 'verification_pending' || input.state === 'verifying'
+      ? 'verification'
+      : (input.failedStage ?? 'generation');
+  if (input.state === 'rate_limited') {
+    const retryAt = Date.parse(input.cooldownUntil ?? '');
+    const remaining = Number.isFinite(retryAt)
+      ? Math.max(0, Math.ceil((retryAt - nowMilliseconds) / 1_000))
+      : 0;
+    if (remaining > 0) return { action: 'rate_limited', stage, retryAfterSeconds: remaining };
+  }
+  return { action: 'run', stage };
+}
+
 export const generationResponseJsonSchema =
-  '{"questions":[{"question":"string","options":["string","string","string","string"],"correctOptionIndex":0,"explanation":"approximately 40-60 words","subject":"string","topic":"string","difficulty":"easy|medium|hard","language":"en|hi","verificationMethod":"model_review"}]}';
+  '{"questions":[{"question":"string","options":["string","string","string","string"],"correctOptionIndex":0,"explanation":"maximum 40 words","subject":"string","topic":"string"}]}';
 
 export const verificationResponseJsonSchema =
   '{"results":[{"questionId":"input ID","status":"verified|rejected|needs_deterministic_check","correctedOptionIndex":null,"confidence":0.0,"rejectionReason":null}]}';
@@ -255,11 +319,50 @@ export function compactVerificationPayload(candidates: readonly VerificationCand
   };
 }
 
-export function groqMaxTokens(stage: 'generation' | 'verification', questionCount: number): number {
-  const boundedCount = Math.max(1, Math.min(200, questionCount));
+export function generationBatchSize(remaining: number, configuredBatchSize = 5): number {
+  return Math.max(1, Math.min(5, configuredBatchSize, remaining));
+}
+
+export function generationBatchCount(questionCount: number, configuredBatchSize = 5): number {
+  return Math.ceil(Math.max(1, questionCount) / Math.max(1, Math.min(5, configuredBatchSize)));
+}
+
+export function groqMaxTokens(
+  stage: 'generation' | 'verification',
+  questionCount: number,
+  generationMaximum = 2_200,
+  verificationMaximum = 1_200,
+): number {
+  const boundedCount = Math.max(1, Math.min(5, questionCount));
   return stage === 'generation'
-    ? Math.min(6_000, Math.max(900, boundedCount * 420 + 300))
-    : Math.min(2_400, Math.max(256, boundedCount * 110 + 160));
+    ? Math.min(generationMaximum, Math.max(700, boundedCount * 400 + 200))
+    : Math.min(verificationMaximum, Math.max(300, boundedCount * 180 + 200));
+}
+
+export function groqGenerationFallbackModels(configuredModel: string): string[] {
+  return [...new Set([configuredModel, 'llama-3.1-8b-instant', 'openai/gpt-oss-20b'])];
+}
+
+export function selectAvailableGroqModel(
+  models: readonly string[],
+  cooldowns: Readonly<Record<string, string | undefined>>,
+  nowMilliseconds = Date.now(),
+): { model: string; fallbackDecision: string } | { retryAfterSeconds: number } {
+  for (let index = 0; index < models.length; index += 1) {
+    const model = models[index];
+    if (!model) continue;
+    const cooldown = Date.parse(cooldowns[model] ?? '');
+    if (!Number.isFinite(cooldown) || cooldown <= nowMilliseconds)
+      return {
+        model,
+        fallbackDecision: index === 0 ? 'primary' : `fallback:${model}`,
+      };
+  }
+  const remaining = models
+    .map((model) => Date.parse(cooldowns[model] ?? ''))
+    .filter(Number.isFinite)
+    .map((until) => Math.ceil((until - nowMilliseconds) / 1_000));
+  return { retryAfterSeconds: Math.max(1, Math.min(...remaining)) };
 }
 
 export function groqModelForStage(
@@ -309,8 +412,44 @@ function parseJsonContent(content: string): unknown {
   }
 }
 
-export function parseGenerationContent(content: string): z.infer<typeof generatedBatchSchema> {
-  return generatedBatchSchema.parse(parseJsonContent(content));
+const providerGeneratedQuestionSchema = z
+  .object({
+    question: z.string().trim().min(12).max(1200),
+    options: z.array(z.string().trim().min(1).max(500)).length(4),
+    correctOptionIndex: z.number().int().min(0).max(3),
+    explanation: z.string().trim().min(8).max(500),
+    subject: z.string().trim().min(1).max(120),
+    topic: z.string().trim().min(1).max(120),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.explanation.split(/\s+/u).filter(Boolean).length > 40)
+      context.addIssue({
+        code: 'custom',
+        path: ['explanation'],
+        message: 'Explanation must not exceed 40 words.',
+      });
+  });
+const providerGeneratedBatchSchema = z
+  .object({ questions: z.array(providerGeneratedQuestionSchema).min(1).max(5) })
+  .strict();
+
+export function parseGenerationContent(
+  content: string,
+  defaults: { difficulty: 'easy' | 'medium' | 'hard'; language: 'en' | 'hi' } = {
+    difficulty: 'medium',
+    language: 'en',
+  },
+): z.infer<typeof generatedBatchSchema> {
+  const parsed = providerGeneratedBatchSchema.parse(parseJsonContent(content));
+  return generatedBatchSchema.parse({
+    questions: parsed.questions.map((question) => ({
+      ...question,
+      difficulty: defaults.difficulty,
+      language: defaults.language,
+      verificationMethod: 'model_review' as const,
+    })),
+  });
 }
 
 export function normaliseVerificationShape(value: unknown): unknown {
@@ -437,7 +576,6 @@ export function buildGenerationPrompt(
   config: AiExamConfiguration,
   request: AiTestRequest,
   count: number,
-  seen: readonly string[],
   seed: string,
 ): string {
   const topics =
@@ -446,5 +584,5 @@ export function buildGenerationPrompt(
           .map(([subject, values]) => `${subject}: ${values.join(', ')}`)
           .join('; ')
       : `${request.subject}: ${(config.subjects[request.subject] ?? []).join(', ')}`;
-  return `VERSION=${config.promptVersion}\nSEED=${seed}\nEXAM=${config.name}\nTIER=${request.tierStage}\nSUBJECT=${request.subject}\nTOPIC=${request.topic ?? 'mixed'}\nDIFFICULTY=${request.difficulty}\nLANGUAGE=${request.language}\nCOUNT=${String(count)}\nSYLLABUS=${topics}\n${config.promptInstructions}\nWrite distinct four-option MCQs with exactly one correct answer. Explanations must be approximately 40–60 words. Reject ambiguity, unstable facts, hidden context and repeated templates. Avoid these prior fingerprints: ${seen.slice(-12).join(',') || 'none'}.\nReturn only JSON matching: ${generationResponseJsonSchema}`;
+  return `VERSION=${config.promptVersion}\nSEED=${seed}\nEXAM=${config.name}\nTIER=${request.tierStage}\nSUBJECT=${request.subject}\nTOPIC=${request.topic ?? 'mixed'}\nDIFFICULTY=${request.difficulty}\nLANGUAGE=${request.language}\nCOUNT=${String(Math.min(5, count))}\nSYLLABUS=${topics}\n${config.promptInstructions}\nWrite distinct, unambiguous MCQs with exactly four options and one correct answer. Keep every explanation at or below 40 words. Do not include planning, Markdown, commentary or extra fields. Return only JSON matching: ${generationResponseJsonSchema}`;
 }

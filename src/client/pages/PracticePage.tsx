@@ -1,6 +1,7 @@
 import { ArrowRight, Bot, CheckCircle2, Clock3, ShieldCheck } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
+import { TurnstileWidget, turnstileEnabled } from '../TurnstileWidget';
 import { useVisitor } from '../visitor-context';
 
 interface ExamConfiguration {
@@ -53,12 +54,23 @@ export function PracticePage() {
   const [cooldownSeconds, setCooldownSeconds] = useState(0);
   const [automaticRetryAvailable, setAutomaticRetryAvailable] = useState(true);
   const generationInFlight = useRef(false);
+  const continuationTimer = useRef<number | undefined>(undefined);
+  const [clientRetrySeconds, setClientRetrySeconds] = useState(20);
+  const [turnstileToken, setTurnstileToken] = useState<string>();
+  const [turnstileReset, setTurnstileReset] = useState(0);
 
   useEffect(() => {
     void fetch('/api/ai/config')
-      .then((response) => response.json() as Promise<{ examinations: ExamConfiguration[] }>)
+      .then(
+        (response) =>
+          response.json() as Promise<{
+            examinations: ExamConfiguration[];
+            clientRetrySeconds?: number;
+          }>,
+      )
       .then((data) => {
         setExaminations(data.examinations);
+        if (data.clientRetrySeconds) setClientRetrySeconds(data.clientRetrySeconds);
       })
       .catch(() => {
         setError('AI test configuration could not be loaded.');
@@ -103,35 +115,21 @@ export function PracticePage() {
       if (retryMode === 'automatic') setAutomaticRetryAvailable(false);
       try {
         const query = retryMode === 'automatic' ? '?retry=automatic' : '';
-        const generation = fetch(`/api/ai/attempts/${active.attemptId}/generate${query}`, {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${active.attemptToken}` },
-        });
-        let finished = false;
-        while (!finished) {
-          await new Promise((resolve) => window.setTimeout(resolve, 650));
-          const progressResponse = await fetch(`/api/ai/attempts/${active.attemptId}/generation`, {
+        const generatedResponse = await fetch(
+          `/api/ai/attempts/${active.attemptId}/generate${query}`,
+          {
+            method: 'POST',
             headers: { Authorization: `Bearer ${active.attemptToken}` },
-          });
-          const progress = (await progressResponse.json()) as {
-            status?: string;
-            stageLabel?: string;
-            error?: string;
-          };
-          if (progress.stageLabel) setCurrentStage(progress.stageLabel);
-          finished =
-            progress.status === 'completed' ||
-            progress.status === 'failed' ||
-            progress.status === 'exhausted' ||
-            progress.status === 'rate_limited' ||
-            progress.status === 'retry_failed';
-        }
-        const generatedResponse = await generation;
+          },
+        );
         const generated = (await generatedResponse.json()) as {
           error?: string;
           errorCode?: string;
-          stage?: string;
+          generationStatus?: string;
+          recoverable?: boolean;
           retryAfterSeconds?: number;
+          stage?: string;
+          status?: string;
         };
         if (
           generatedResponse.status === 429 &&
@@ -139,6 +137,7 @@ export function PracticePage() {
           generated.retryAfterSeconds
         ) {
           const seconds = Math.max(1, generated.retryAfterSeconds);
+          if (continuationTimer.current) window.clearTimeout(continuationTimer.current);
           setCooldownUntil(Date.now() + seconds * 1000);
           setCooldownSeconds(seconds);
           setCurrentStage(
@@ -152,13 +151,39 @@ export function PracticePage() {
           setStarting(false);
           return;
         }
-        if (!generatedResponse.ok)
+        const ready =
+          generatedResponse.status === 200 ||
+          generated.status === 'ready' ||
+          generated.status === 'completed' ||
+          generated.generationStatus === 'ready';
+        if (ready) {
+          if (continuationTimer.current) window.clearTimeout(continuationTimer.current);
+          localStorage.removeItem('examforge.pending_ai_attempt');
+          localStorage.setItem('examforge.active_attempt', active.attemptId);
+          setActiveGeneration(undefined);
+          setCooldownUntil(undefined);
+          await navigate(`/attempts/${active.attemptId}`);
+          return;
+        }
+        if (generatedResponse.status === 409 && generated.recoverable === false) {
+          if (continuationTimer.current) window.clearTimeout(continuationTimer.current);
+          localStorage.removeItem('examforge.pending_ai_attempt');
+          setActiveGeneration(undefined);
+          setTurnstileToken(undefined);
+          setTurnstileReset((value) => value + 1);
+          throw new Error(generated.error ?? 'This saved attempt cannot be resumed.');
+        }
+        if (!generatedResponse.ok && generatedResponse.status !== 202)
           throw new Error(generated.error ?? 'Question generation failed.');
-        localStorage.removeItem('examforge.pending_ai_attempt');
-        localStorage.setItem('examforge.active_attempt', active.attemptId);
-        setActiveGeneration(undefined);
-        setCooldownUntil(undefined);
-        await navigate(`/attempts/${active.attemptId}`);
+        if (generated.stage === 'verification' || generated.status === 'verification_pending')
+          setCurrentStage('Verifying answers');
+        else setCurrentStage('Generating questions');
+        const waitSeconds = Math.max(1, generated.retryAfterSeconds ?? clientRetrySeconds);
+        if (continuationTimer.current) window.clearTimeout(continuationTimer.current);
+        continuationTimer.current = window.setTimeout(() => {
+          void runGeneration(active, 'manual');
+        }, waitSeconds * 1_000);
+        setStarting(false);
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : 'Question generation failed.');
         setStarting(false);
@@ -167,7 +192,7 @@ export function PracticePage() {
         generationInFlight.current = false;
       }
     },
-    [navigate],
+    [clientRetrySeconds, navigate],
   );
 
   useEffect(() => {
@@ -201,7 +226,7 @@ export function PracticePage() {
         )
         .then((progress) => {
           if (progress.stageLabel) setCurrentStage(progress.stageLabel);
-          if (progress.status === 'completed') {
+          if (progress.status === 'ready' || progress.status === 'completed') {
             localStorage.removeItem('examforge.pending_ai_attempt');
             void navigate(`/attempts/${active.attemptId}`);
             return;
@@ -212,6 +237,24 @@ export function PracticePage() {
             setError(
               `Groq cooldown active. This saved ${progress.retryStage ?? 'generation'} stage remains recoverable.`,
             );
+            return;
+          }
+          if (
+            progress.status === 'pending' ||
+            progress.status === 'generating' ||
+            progress.status === 'verification_pending' ||
+            progress.status === 'verifying' ||
+            progress.status === 'retryable'
+          )
+            setStarting(false);
+          if (
+            progress.status === 'cancelled' ||
+            progress.status === 'expired' ||
+            progress.status === 'invalid'
+          ) {
+            localStorage.removeItem('examforge.pending_ai_attempt');
+            setActiveGeneration(undefined);
+            setError('The saved attempt ended and cannot be resumed. Create a new attempt.');
           }
         })
         .catch(() => {
@@ -221,6 +264,54 @@ export function PracticePage() {
       localStorage.removeItem('examforge.pending_ai_attempt');
     }
   }, [activeGeneration, navigate]);
+
+  useEffect(() => {
+    if (!activeGeneration) return;
+    const checkProgress = async () => {
+      try {
+        const response = await fetch(`/api/ai/attempts/${activeGeneration.attemptId}/generation`, {
+          headers: { Authorization: `Bearer ${activeGeneration.attemptToken}` },
+        });
+        const progress = (await response.json()) as {
+          status?: string;
+          stageLabel?: string;
+          cooldownUntil?: string;
+          retryStage?: string;
+        };
+        if (progress.stageLabel) setCurrentStage(progress.stageLabel);
+        if (progress.status === 'ready' || progress.status === 'completed') {
+          if (continuationTimer.current) window.clearTimeout(continuationTimer.current);
+          localStorage.removeItem('examforge.pending_ai_attempt');
+          localStorage.setItem('examforge.active_attempt', activeGeneration.attemptId);
+          setActiveGeneration(undefined);
+          setCooldownUntil(undefined);
+          await navigate(`/attempts/${activeGeneration.attemptId}`);
+        } else if (progress.status === 'rate_limited' && progress.cooldownUntil) {
+          setCooldownUntil(Date.parse(progress.cooldownUntil));
+          setCurrentStage(
+            progress.retryStage === 'verification'
+              ? 'Verification paused by provider cooldown'
+              : 'Generation paused by provider cooldown',
+          );
+        }
+      } catch {
+        // Polling is observational only; a later poll or explicit retry can recover.
+      }
+    };
+    const timer = window.setInterval(() => {
+      void checkProgress();
+    }, clientRetrySeconds * 1_000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [activeGeneration, clientRetrySeconds, navigate]);
+
+  useEffect(
+    () => () => {
+      if (continuationTimer.current) window.clearTimeout(continuationTimer.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     if (
@@ -239,6 +330,10 @@ export function PracticePage() {
       return;
     }
     if (!visitorUuid || !selected || !tier || status !== 'ready') return;
+    if (turnstileEnabled && !turnstileToken) {
+      setError('Complete human verification before generating a test.');
+      return;
+    }
     setStarting(true);
     setError(undefined);
     setCurrentStage(stages[0]);
@@ -260,6 +355,7 @@ export function PracticePage() {
           customDurationMinutes: timerMode === 'custom' ? duration : null,
           ...(nickname.trim() ? { nickname: nickname.trim() } : {}),
           allowRepetition: false,
+          ...(turnstileToken ? { turnstileToken } : {}),
         }),
       });
       const created = (await createResponse.json()) as {
@@ -280,6 +376,8 @@ export function PracticePage() {
       setError(cause instanceof Error ? cause.message : 'Question generation failed.');
       setStarting(false);
       setCurrentStage(undefined);
+      setTurnstileToken(undefined);
+      setTurnstileReset((value) => value + 1);
     }
   };
 
@@ -499,12 +597,20 @@ export function PracticePage() {
           {!fullMock && (
             <p className="muted-copy">Custom practice is not an official simulation.</p>
           )}
+          {turnstileEnabled && !activeGeneration && (
+            <TurnstileWidget
+              action="generate"
+              onToken={setTurnstileToken}
+              resetKey={turnstileReset}
+            />
+          )}
           <button
             className="primary-button"
             disabled={
               starting ||
               cooldownSeconds > 0 ||
-              (!activeGeneration && (!selected || status !== 'ready'))
+              (!activeGeneration && (!selected || status !== 'ready')) ||
+              (!activeGeneration && turnstileEnabled && !turnstileToken)
             }
             onClick={() => void start()}
           >

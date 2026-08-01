@@ -379,10 +379,96 @@ export const attempts = sqliteTable(
     answerChangeCount: integer('answer_change_count').notNull().default(0),
     postName: text('post_name'),
     stageName: text('stage_name'),
+    generationStatus: text('generation_status').notNull().default('ready'),
+    generationError: text('generation_error'),
     createdAt: text('created_at').notNull(),
   },
   (table) => [
     index('attempts_visitor_status_idx').on(table.visitorNumber, table.status, table.createdAt),
+  ],
+);
+
+export const generationRuns = sqliteTable(
+  'generation_runs',
+  {
+    id: text('id').primaryKey(),
+    attemptId: text('attempt_id')
+      .notNull()
+      .unique()
+      .references(() => attempts.id, { onDelete: 'cascade' }),
+    visitorNumber: integer('visitor_number').notNull(),
+    requestFingerprint: text('request_fingerprint').notNull(),
+    activeKey: text('active_key').unique(),
+    stage: text('stage').notNull(),
+    status: text('status').notNull(),
+    state: text('state').notNull().default('pending'),
+    failedStage: text('failed_stage'),
+    failureRecoverable: integer('failure_recoverable', { mode: 'boolean' }).notNull().default(true),
+    stateUpdatedAt: text('state_updated_at'),
+    resumeCount: integer('resume_count').notNull().default(0),
+    requestedCount: integer('requested_count').notNull(),
+    acceptedCount: integer('accepted_count').notNull().default(0),
+    rejectedCount: integer('rejected_count').notNull().default(0),
+    inputTokens: integer('input_tokens').notNull().default(0),
+    outputTokens: integer('output_tokens').notNull().default(0),
+    estimatedCostUsd: real('estimated_cost_usd').notNull().default(0),
+    candidateJson: text('candidate_json'),
+    cooldownUntil: text('cooldown_until'),
+    retryStage: text('retry_stage'),
+    autoRetryUsed: integer('auto_retry_used', { mode: 'boolean' }).notNull().default(false),
+    lockStage: text('lock_stage'),
+    lockToken: text('lock_token'),
+    lockExpiresAt: text('lock_expires_at'),
+    errorSummary: text('error_summary'),
+    startedAt: text('started_at'),
+    completedAt: text('completed_at'),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    index('generation_runs_visitor_day_idx').on(table.visitorNumber, table.createdAt),
+    index('generation_runs_cooldown_idx').on(table.stage, table.cooldownUntil),
+    index('generation_runs_state_lease_idx').on(table.state, table.lockExpiresAt),
+  ],
+);
+
+export const aiProviderGate = sqliteTable('ai_provider_gate', {
+  id: integer('id').primaryKey(),
+  lockToken: text('lock_token'),
+  lockAttemptId: text('lock_attempt_id'),
+  lockModel: text('lock_model'),
+  lockStage: text('lock_stage'),
+  lockExpiresAt: text('lock_expires_at'),
+  nextAllowedAt: text('next_allowed_at').notNull(),
+  updatedAt: text('updated_at').notNull(),
+});
+
+export const aiProviderModelCooldowns = sqliteTable(
+  'ai_provider_model_cooldowns',
+  {
+    model: text('model').primaryKey(),
+    cooldownUntil: text('cooldown_until').notNull(),
+    providerStatus: integer('provider_status').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [index('ai_provider_model_cooldowns_until_idx').on(table.cooldownUntil)],
+);
+
+export const attemptGenerationHashes = sqliteTable(
+  'attempt_generation_hashes',
+  {
+    id: text('id').primaryKey(),
+    attemptId: text('attempt_id')
+      .notNull()
+      .references(() => attempts.id, { onDelete: 'cascade' }),
+    normalizedSha256: text('normalized_sha256').notNull(),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('attempt_generation_hashes_identity_unique').on(
+      table.attemptId,
+      table.normalizedSha256,
+    ),
+    index('attempt_generation_hashes_hash_idx').on(table.normalizedSha256),
   ],
 );
 

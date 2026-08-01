@@ -3,15 +3,21 @@ import {
   aiTestRequestSchema,
   buildGenerationPrompt,
   compactVerificationPayload,
+  decideGenerationAction,
   deterministicArithmeticAnswer,
   deterministicQuestionIssues,
   generatedBatchSchema,
+  generationBatchCount,
+  generationBatchSize,
+  groqGenerationFallbackModels,
   groqMaxTokens,
   groqModelForStage,
+  normaliseQuestion,
   parseGenerationContent,
   parseRetryAfterSeconds,
   parseVerificationContent,
   requireVerificationCoverage,
+  selectAvailableGroqModel,
   shouldAutomaticallyRetry,
   optionIndependentText,
   tokenSimilarity,
@@ -93,10 +99,10 @@ describe('AI assessment architecture', () => {
       timerMode: 'custom',
       customDurationMinutes: 10,
     });
-    const prompt = buildGenerationPrompt(config, input, 10, ['seen-fingerprint'], 'seed');
+    const prompt = buildGenerationPrompt(config, input, 10, 'seed');
     expect(prompt).toContain('VERSION=ssc-chsl-v1');
-    expect(prompt).toContain('COUNT=10');
-    expect(prompt).toContain('seen-fingerprint');
+    expect(prompt).toContain('COUNT=5');
+    expect(prompt).not.toContain('seen-fingerprint');
   });
 });
 
@@ -153,10 +159,38 @@ describe('Groq response parsing', () => {
 
   it('parses an exact five-question generation response', () => {
     const questions = Array.from({ length: 5 }, (_, index) => ({
-      ...question,
       question: `Calculate 12 + ${String(index + 8)} using the standard addition rule.`,
+      options: question.options,
+      correctOptionIndex: question.correctOptionIndex,
+      explanation: question.explanation,
+      subject: question.subject,
+      topic: question.topic,
     }));
     expect(parseGenerationContent(JSON.stringify({ questions })).questions).toHaveLength(5);
+  });
+
+  it('rejects provider batches over five and explanations over forty words', () => {
+    const providerQuestion = {
+      question: question.question,
+      options: question.options,
+      correctOptionIndex: question.correctOptionIndex,
+      explanation: Array.from({ length: 41 }, () => 'word').join(' '),
+      subject: question.subject,
+      topic: question.topic,
+    };
+    expect(() => parseGenerationContent(JSON.stringify({ questions: [providerQuestion] }))).toThrow(
+      'Explanation must not exceed 40 words.',
+    );
+    expect(() =>
+      parseGenerationContent(
+        JSON.stringify({
+          questions: Array.from({ length: 6 }, () => ({
+            ...providerQuestion,
+            explanation: question.explanation,
+          })),
+        }),
+      ),
+    ).toThrow();
   });
 });
 
@@ -205,9 +239,152 @@ describe('Groq rate-limit architecture', () => {
   });
 
   it('always bounds provider output tokens by stage and question count', () => {
-    expect(groqMaxTokens('generation', 5)).toBe(2_400);
-    expect(groqMaxTokens('verification', 5)).toBe(710);
-    expect(groqMaxTokens('generation', 200)).toBe(6_000);
-    expect(groqMaxTokens('verification', 200)).toBe(2_400);
+    expect(groqMaxTokens('generation', 1)).toBe(700);
+    expect(groqMaxTokens('generation', 5)).toBe(2_200);
+    expect(groqMaxTokens('generation', 200)).toBe(2_200);
+    expect(groqMaxTokens('verification', 1)).toBe(380);
+    expect(groqMaxTokens('verification', 5)).toBe(1_100);
+    expect(groqMaxTokens('verification', 200)).toBe(1_100);
+    expect(groqMaxTokens('generation', 5, 1_800, 1_000)).toBe(1_800);
+    expect(groqMaxTokens('verification', 5, 1_800, 1_000)).toBe(1_000);
+  });
+
+  it('uses exactly two sequential generation batches for ten questions', () => {
+    expect(generationBatchSize(10, 5)).toBe(5);
+    expect(generationBatchSize(5, 5)).toBe(5);
+    expect(generationBatchCount(10, 5)).toBe(2);
+  });
+
+  it('batches all uncertain questions into one compact verification payload', () => {
+    const candidates = Array.from({ length: 5 }, (_, index) => ({
+      questionId: `question-${String(index)}`,
+      question: { ...question, question: `${question.question} ${String(index)}` },
+    }));
+    const payload = compactVerificationPayload(candidates);
+    expect(payload.questions).toHaveLength(5);
+    expect(Object.keys(payload)).toEqual(['questions']);
+  });
+
+  it('skips cooling models in fallback order without duplicating model entries', () => {
+    const models = groqGenerationFallbackModels('llama-3.3-70b-versatile');
+    expect(models).toEqual([
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
+      'openai/gpt-oss-20b',
+    ]);
+    expect(
+      selectAvailableGroqModel(
+        models,
+        { 'llama-3.3-70b-versatile': '2026-08-01T12:01:00.000Z' },
+        Date.parse('2026-08-01T12:00:00.000Z'),
+      ),
+    ).toEqual({ model: 'llama-3.1-8b-instant', fallbackDecision: 'fallback:llama-3.1-8b-instant' });
+    const persistedHashes = new Set([normaliseQuestion(question.question)]);
+    expect(
+      persistedHashes.has(normaliseQuestion('Calculate 12 + 8, using the standard addition rule!')),
+    ).toBe(true);
+  });
+});
+
+describe('idempotent generation state machine', () => {
+  const now = Date.parse('2026-08-01T12:00:00.000Z');
+
+  it('starts pending work and resumes the exact failed stage', () => {
+    expect(
+      decideGenerationAction(
+        { state: 'pending', failedStage: null, cooldownUntil: null, lockExpiresAt: null },
+        now,
+      ),
+    ).toEqual({ action: 'run', stage: 'generation' });
+    expect(
+      decideGenerationAction(
+        {
+          state: 'retryable',
+          failedStage: 'verification',
+          cooldownUntil: null,
+          lockExpiresAt: null,
+        },
+        now,
+      ),
+    ).toEqual({ action: 'run', stage: 'verification' });
+  });
+
+  it('rejects duplicate provider work while a database lease is active', () => {
+    expect(
+      decideGenerationAction(
+        {
+          state: 'generating',
+          failedStage: null,
+          cooldownUntil: null,
+          lockExpiresAt: '2026-08-01T12:00:02.000Z',
+        },
+        now,
+      ),
+    ).toEqual({ action: 'already_running', retryAfterSeconds: 2 });
+  });
+
+  it('reclaims an expired generation or verification lease after a Worker restart', () => {
+    expect(
+      decideGenerationAction(
+        {
+          state: 'generating',
+          failedStage: null,
+          cooldownUntil: null,
+          lockExpiresAt: '2026-08-01T11:59:59.000Z',
+        },
+        now,
+      ),
+    ).toEqual({ action: 'run', stage: 'generation' });
+    expect(
+      decideGenerationAction(
+        {
+          state: 'verification_pending',
+          failedStage: null,
+          cooldownUntil: null,
+          lockExpiresAt: null,
+        },
+        now,
+      ),
+    ).toEqual({ action: 'run', stage: 'verification' });
+  });
+
+  it('preserves generation and verification cooldown stages on the same attempt', () => {
+    expect(
+      decideGenerationAction(
+        {
+          state: 'rate_limited',
+          failedStage: 'generation',
+          cooldownUntil: '2026-08-01T12:00:10.000Z',
+          lockExpiresAt: null,
+        },
+        now,
+      ),
+    ).toEqual({ action: 'rate_limited', stage: 'generation', retryAfterSeconds: 10 });
+    expect(
+      decideGenerationAction(
+        {
+          state: 'rate_limited',
+          failedStage: 'verification',
+          cooldownUntil: '2026-08-01T11:59:59.000Z',
+          lockExpiresAt: null,
+        },
+        now,
+      ),
+    ).toEqual({ action: 'run', stage: 'verification' });
+  });
+
+  it('returns ready idempotently and structured terminal conflicts', () => {
+    expect(
+      decideGenerationAction(
+        { state: 'ready', failedStage: null, cooldownUntil: null, lockExpiresAt: null },
+        now,
+      ),
+    ).toEqual({ action: 'ready' });
+    expect(
+      decideGenerationAction(
+        { state: 'invalid', failedStage: null, cooldownUntil: null, lockExpiresAt: null },
+        now,
+      ),
+    ).toEqual({ action: 'terminal', errorCode: 'ATTEMPT_INVALID' });
   });
 });

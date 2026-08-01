@@ -21,12 +21,13 @@
     "test:e2e:install": "playwright install chromium",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply examforge-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply examforge-db --remote",
+    "db:migrate:remote": "wrangler d1 migrations apply examforge-db --remote --env production",
+    "ai:recover:remote": "wrangler d1 execute examforge-db --remote --env production --file tools/recover_ai_attempts.sql",
     "cf:types": "wrangler types",
-    "deploy:dry": "npm run build && wrangler deploy --dry-run",
-    "deploy:dry:preview": "npm run build:preview && wrangler deploy --dry-run",
-    "deploy:preview": "npm run build:preview && wrangler deploy",
-    "deploy": "npm run build && wrangler deploy"
+    "deploy:dry": "npm run build && wrangler deploy --dry-run --env production",
+    "deploy:dry:preview": "npm run build:preview && wrangler deploy --dry-run --env preview",
+    "deploy:preview": "npm run build:preview && wrangler deploy --env preview",
+    "deploy": "npm run build && wrangler deploy --env production"
   },
   "dependencies": {
     "@fontsource/archivo": "^5.2.6",

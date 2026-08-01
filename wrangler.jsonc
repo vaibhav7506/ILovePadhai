@@ -21,7 +21,8 @@
   "kv_namespaces": [
     {
       "binding": "PUBLIC_CACHE",
-      "id": "00000000000000000000000000000001",
+      "id": "bbbd704afb554606a4e4a81183740da4",
+      "remote": true,
     },
   ],
   "r2_buckets": [
@@ -41,14 +42,25 @@
     "GROQ_MODEL": "llama-3.3-70b-versatile",
     "GROQ_VERIFICATION_MODEL": "openai/gpt-oss-20b",
     "AI_GENERATION_ENABLED": "on",
+    "AI_GENERATION_BATCH_SIZE": "5",
+    "AI_GENERATION_MAX_OUTPUT_TOKENS": "2200",
+    "AI_VERIFICATION_MAX_OUTPUT_TOKENS": "1200",
+    "AI_PROVIDER_MIN_INTERVAL_MS": "2100",
+    "AI_CLIENT_RETRY_SECONDS": "20",
     "AI_VISITOR_DAILY_LIMIT": "5",
     "AI_GLOBAL_DAILY_REQUEST_LIMIT": "500",
-    "AI_GLOBAL_DAILY_TOKEN_LIMIT": "2000000",
+    "AI_GLOBAL_DAILY_TOKEN_LIMIT": "90000",
   },
   "observability": {
     "enabled": true,
-    "logs": { "enabled": true, "head_sampling_rate": 1 },
-    "traces": { "enabled": true, "head_sampling_rate": 0.05 },
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05,
+    },
   },
   "env": {
     "preview": {
@@ -84,6 +96,11 @@
         "GROQ_MODEL": "llama-3.3-70b-versatile",
         "GROQ_VERIFICATION_MODEL": "openai/gpt-oss-20b",
         "AI_GENERATION_ENABLED": "on",
+        "AI_GENERATION_BATCH_SIZE": "5",
+        "AI_GENERATION_MAX_OUTPUT_TOKENS": "2200",
+        "AI_VERIFICATION_MAX_OUTPUT_TOKENS": "1200",
+        "AI_PROVIDER_MIN_INTERVAL_MS": "2100",
+        "AI_CLIENT_RETRY_SECONDS": "20",
         "AI_VISITOR_DAILY_LIMIT": "5",
         "AI_GLOBAL_DAILY_REQUEST_LIMIT": "500",
         "AI_GLOBAL_DAILY_TOKEN_LIMIT": "2000000",
@@ -97,14 +114,14 @@
         {
           "binding": "DB",
           "database_name": "examforge-db",
-          "database_id": "00000000-0000-0000-0000-000000000003",
+          "database_id": "950999c7-21d9-4bff-ab75-31bbef90f899",
           "migrations_dir": "db/migrations",
         },
       ],
       "kv_namespaces": [
         {
           "binding": "PUBLIC_CACHE",
-          "id": "00000000000000000000000000000003",
+          "id": "bbbd704afb554606a4e4a81183740da4",
         },
       ],
       "r2_buckets": [
@@ -118,12 +135,17 @@
         "PRODUCT_NAME": "ExamForge",
         "PRODUCT_DESCRIPTION": "Verified exam practice. No account required.",
         "TURNSTILE_MODE": "enforced",
-        "TURNSTILE_HOSTNAMES": "examforge.example.invalid",
+        "TURNSTILE_HOSTNAMES": "examforge.vaibhav7506.workers.dev",
         "ADMIN_MODE": "access",
-        "GROQ_ENABLED": "off",
+        "GROQ_ENABLED": "on",
         "GROQ_MODEL": "llama-3.3-70b-versatile",
         "GROQ_VERIFICATION_MODEL": "openai/gpt-oss-20b",
         "AI_GENERATION_ENABLED": "on",
+        "AI_GENERATION_BATCH_SIZE": "5",
+        "AI_GENERATION_MAX_OUTPUT_TOKENS": "2200",
+        "AI_VERIFICATION_MAX_OUTPUT_TOKENS": "1200",
+        "AI_PROVIDER_MIN_INTERVAL_MS": "2100",
+        "AI_CLIENT_RETRY_SECONDS": "20",
         "AI_VISITOR_DAILY_LIMIT": "5",
         "AI_GLOBAL_DAILY_REQUEST_LIMIT": "500",
         "AI_GLOBAL_DAILY_TOKEN_LIMIT": "2000000",

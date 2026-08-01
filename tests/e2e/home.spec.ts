@@ -18,11 +18,14 @@ test('renders the examination desk without account UI', async ({ page }) => {
   await expect(
     page.getByRole('link', { name: 'Start AI test', exact: true }).first(),
   ).toBeVisible();
-  await expect(page.getByText(/anonymous learners? (has|have) visited/).first()).toBeVisible();
+  await expect(page.getByText(/anonymous learners? (has|have) visited/).first()).toBeVisible({
+    timeout: 15_000,
+  });
   await expect(page.getByRole('link', { name: /sign in|sign up/i })).toHaveCount(0);
 });
 
 test('anonymous identity persists without incrementing on reload', async ({ page, request }) => {
+  test.setTimeout(90_000);
   const visitorUuid = crypto.randomUUID();
   const registration = await request.post('/api/visitors/register', {
     data: {
@@ -38,13 +41,21 @@ test('anonymous identity persists without incrementing on reload', async ({ page
     localStorage.setItem('examforge.visitor_uuid', registeredVisitorUuid);
   }, visitorUuid);
 
+  const pageRegistration = page.waitForResponse(
+    (response) => response.url().endsWith('/api/visitors/register') && response.ok(),
+  );
   await page.goto('/');
+  await pageRegistration;
   const footfall = page.getByText(/You’re learner #/);
   await expect(footfall).toBeVisible();
   const initialText = await footfall.textContent();
   const initialId = await page.evaluate(() => localStorage.getItem('examforge.visitor_uuid'));
 
+  const reloadRegistration = page.waitForResponse(
+    (response) => response.url().endsWith('/api/visitors/register') && response.ok(),
+  );
   await page.reload();
+  await reloadRegistration;
   await expect(page.getByText(initialText ?? '')).toBeVisible();
   const reloadedId = await page.evaluate(() => localStorage.getItem('examforge.visitor_uuid'));
   expect(reloadedId).toBe(initialId);
@@ -82,7 +93,9 @@ test('leaderboard is honest, private by default, and empty without real entries'
 test('mobile layout retains examination and footfall access', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'mobile');
   await page.goto('/');
-  await expect(page.getByText(/anonymous learners? (has|have) visited/).first()).toBeVisible();
+  await expect(page.getByText(/anonymous learners? (has|have) visited/).first()).toBeVisible({
+    timeout: 15_000,
+  });
   await expect(page.getByRole('heading', { name: '10th–12th level' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Graduation level' })).toBeVisible();
 });

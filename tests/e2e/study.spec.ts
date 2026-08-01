@@ -12,6 +12,9 @@ test.afterEach(async ({ page, request }) => {
 });
 
 test('creates an anonymous evidence-based study plan without an account', async ({ page }) => {
+  const dashboardLoaded = page.waitForResponse(
+    (response) => response.url().includes('/api/study/dashboard') && response.ok(),
+  );
   await page.goto('/study');
   await expect(
     page.getByRole('heading', { name: 'Your mistakes become tomorrow’s worklist.' }),
@@ -22,6 +25,7 @@ test('creates an anonymous evidence-based study plan without an account', async 
   await expect(
     page.getByText('No official calendar event has passed verification yet.'),
   ).toBeVisible();
+  await dashboardLoaded;
   await page.getByLabel('Available minutes each day').fill('45');
   await page.getByRole('button', { name: 'Create my plan' }).click();
   await expect(page.getByText('Study plan updated from your real evidence.')).toBeVisible();

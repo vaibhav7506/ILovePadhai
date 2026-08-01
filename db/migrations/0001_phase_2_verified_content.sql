@@ -265,35 +265,64 @@ BEGIN
   SELECT RAISE(ABORT, 'answer-key provenance is immutable');
 END;
 
-CREATE TRIGGER `question_publish_gate`
+CREATE TRIGGER `question_publish_options_gate`
 BEFORE UPDATE OF `verification_status` ON `questions`
-WHEN NEW.`verification_status` = 'published' AND OLD.`verification_status` <> 'published'
+WHEN NEW.`verification_status` = 'published'
+  AND OLD.`verification_status` <> 'published'
+  AND (SELECT COUNT(*) FROM `question_options` WHERE `question_id` = NEW.`id`) <> 4
 BEGIN
-  SELECT CASE
-    WHEN (SELECT COUNT(*) FROM `question_options` WHERE `question_id` = NEW.`id`) <> 4
-      THEN RAISE(ABORT, 'published question must have exactly four options')
-    WHEN NEW.`content_origin` = 'official_pyq' AND OLD.`verification_status` <> 'verified_official'
-      THEN RAISE(ABORT, 'official PYQ must be verified before publication')
-    WHEN NEW.`content_origin` = 'official_pyq' AND NOT EXISTS (
-      SELECT 1 FROM `answer_key_versions`
-      WHERE `question_id` = NEW.`id` AND `key_type` = 'final' AND `is_current` = 1
-    )
-      THEN RAISE(ABORT, 'official PYQ requires a current final answer key')
-    WHEN NEW.`content_origin` IN ('editorial', 'ai_generated_practice') AND OLD.`verification_status` <> 'verified_editorial'
-      THEN RAISE(ABORT, 'editorial content must be verified before publication')
-  END;
+  SELECT RAISE(ABORT, 'published question must have exactly four options');
 END;
 
-CREATE TRIGGER `note_publish_gate`
-BEFORE UPDATE OF `verification_status` ON `notes`
-WHEN NEW.`verification_status` = 'published' AND OLD.`verification_status` <> 'published'
+CREATE TRIGGER `question_publish_official_verification_gate`
+BEFORE UPDATE OF `verification_status` ON `questions`
+WHEN NEW.`verification_status` = 'published'
+  AND OLD.`verification_status` <> 'published'
+  AND NEW.`content_origin` = 'official_pyq'
+  AND OLD.`verification_status` <> 'verified_official'
 BEGIN
-  SELECT CASE
-    WHEN OLD.`verification_status` <> 'verified_editorial'
-      THEN RAISE(ABORT, 'note must be editorially verified before publication')
-    WHEN NOT EXISTS (SELECT 1 FROM `note_citations` WHERE `note_id` = NEW.`id`)
-      THEN RAISE(ABORT, 'published note requires at least one citation')
-  END;
+  SELECT RAISE(ABORT, 'official PYQ must be verified before publication');
+END;
+
+CREATE TRIGGER `question_publish_answer_key_gate`
+BEFORE UPDATE OF `verification_status` ON `questions`
+WHEN NEW.`verification_status` = 'published'
+  AND OLD.`verification_status` <> 'published'
+  AND NEW.`content_origin` = 'official_pyq'
+  AND NOT EXISTS (
+    SELECT 1 FROM `answer_key_versions`
+    WHERE `question_id` = NEW.`id` AND `key_type` = 'final' AND `is_current` = 1
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'official PYQ requires a current final answer key');
+END;
+
+CREATE TRIGGER `question_publish_editorial_verification_gate`
+BEFORE UPDATE OF `verification_status` ON `questions`
+WHEN NEW.`verification_status` = 'published'
+  AND OLD.`verification_status` <> 'published'
+  AND NEW.`content_origin` IN ('editorial', 'ai_generated_practice')
+  AND OLD.`verification_status` <> 'verified_editorial'
+BEGIN
+  SELECT RAISE(ABORT, 'editorial content must be verified before publication');
+END;
+
+CREATE TRIGGER `note_publish_verification_gate`
+BEFORE UPDATE OF `verification_status` ON `notes`
+WHEN NEW.`verification_status` = 'published'
+  AND OLD.`verification_status` <> 'published'
+  AND OLD.`verification_status` <> 'verified_editorial'
+BEGIN
+  SELECT RAISE(ABORT, 'note must be editorially verified before publication');
+END;
+
+CREATE TRIGGER `note_publish_citation_gate`
+BEFORE UPDATE OF `verification_status` ON `notes`
+WHEN NEW.`verification_status` = 'published'
+  AND OLD.`verification_status` <> 'published'
+  AND NOT EXISTS (SELECT 1 FROM `note_citations` WHERE `note_id` = NEW.`id`)
+BEGIN
+  SELECT RAISE(ABORT, 'published note requires at least one citation');
 END;
 
 INSERT INTO `examinations`

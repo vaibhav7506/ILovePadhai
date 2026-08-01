@@ -5,24 +5,29 @@ import {
   buildGenerationPrompt,
   compactVerificationPayload,
   deterministicQuestionIssues,
+  decideGenerationAction,
   deterministicArithmeticAnswer,
   examConfiguration,
   generatedBatchSchema,
   generatedQuestionSchema,
+  generationBatchSize,
   generationResponseJsonSchema,
+  groqGenerationFallbackModels,
   groqMaxTokens,
-  groqModelForStage,
   normaliseQuestion,
   optionIndependentText,
   parseGenerationContent,
   parseRetryAfterSeconds,
   parseVerificationContent,
   requireVerificationCoverage,
+  selectAvailableGroqModel,
   sha256,
   tokenSimilarity,
   verificationResponseJsonSchema,
   type AiTestRequest,
   type GeneratedQuestion,
+  type GenerationRunStateName,
+  type GenerationWorkStage,
   type VerificationBatch,
 } from '@shared/ai-assessment';
 import { signAttemptToken } from '@shared/attempt-token';
@@ -75,10 +80,16 @@ class AiRateLimitedError extends Error {
   constructor(
     readonly stage: AiResponseStage,
     readonly retryAfterSeconds: number,
+    readonly model?: string,
   ) {
     super('AI provider rate limit reached.');
     this.name = 'AiRateLimitedError';
   }
+}
+
+interface ProviderModelSelection {
+  model: string;
+  fallbackDecision: string;
 }
 
 const routes = new Hono<AiEnvironment>();
@@ -90,6 +101,12 @@ const stageLabels: Record<string, string> = {
   verifying: 'Verifying answers',
   rate_limited: 'Provider cooldown',
   retry_failed: 'Saved attempt needs a manual retry',
+  retryable: 'Saved attempt is ready to resume',
+  verification_pending: 'Questions saved; verification is next',
+  completed: 'Test ready',
+  cancelled: 'Generation cancelled',
+  expired: 'Generation expired',
+  invalid: 'Generation cannot continue',
   ready: 'Test ready',
   failed: 'Generation failed',
 };
@@ -101,51 +118,216 @@ function signingSecret(env: Env): string | null {
 
 async function groqContent(
   env: Env,
+  attemptId: string,
   stage: AiResponseStage,
-  model: string,
+  selection: ProviderModelSelection,
   system: string,
   user: string,
   maxTokens: number,
+  batchSize: number,
   temperature = 0.55,
+  waitForGate = false,
 ): Promise<{ content: string; usage: GroqUsage }> {
   const variables = validateRuntimeEnvironment(env);
   if (variables.GROQ_ENABLED !== 'on' || !variables.GROQ_API_KEY)
     throw new Error('AI practice is temporarily unavailable.');
-  const usesGptOss = model.startsWith('openai/gpt-oss-');
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${variables.GROQ_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      temperature,
-      max_completion_tokens: maxTokens,
-      response_format: { type: 'json_object' },
-      ...(usesGptOss ? { reasoning_effort: 'low', include_reasoning: false } : {}),
-      messages: usesGptOss
-        ? [{ role: 'user', content: `${system}\n${user}` }]
-        : [
-            { role: 'system', content: system },
-            { role: 'user', content: user },
-          ],
-    }),
-    signal: AbortSignal.timeout(25_000),
-  });
-  if (!response.ok) {
-    if (response.status === 429)
-      throw new AiRateLimitedError(
-        stage,
-        parseRetryAfterSeconds(response.headers.get('retry-after')),
-      );
-    throw new AiProviderResponseError(response.status);
+  let providerLock: string;
+  try {
+    providerLock = await acquireProviderGate(
+      env.DB,
+      attemptId,
+      selection.model,
+      stage,
+      variables.AI_PROVIDER_MIN_INTERVAL_MS,
+    );
+  } catch (error) {
+    if (!(waitForGate && error instanceof AiRateLimitedError && !error.model)) throw error;
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(5_000, error.retryAfterSeconds * 1_000)),
+    );
+    providerLock = await acquireProviderGate(
+      env.DB,
+      attemptId,
+      selection.model,
+      stage,
+      variables.AI_PROVIDER_MIN_INTERVAL_MS,
+    );
   }
-  const payload = groqResponseSchema.parse(await response.json());
-  const content = payload.choices[0]?.message.content;
-  if (content === undefined || content.trim() === '')
-    throw new Error('AI response content was empty.');
-  return { content, usage: payload.usage ?? {} };
+  const usesGptOss = selection.model.startsWith('openai/gpt-oss-');
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${variables.GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: selection.model,
+        temperature,
+        max_completion_tokens: maxTokens,
+        response_format: { type: 'json_object' },
+        ...(usesGptOss ? { reasoning_effort: 'low', include_reasoning: false } : {}),
+        messages: usesGptOss
+          ? [{ role: 'user', content: `${system}\n${user}` }]
+          : [
+              { role: 'system', content: system },
+              { role: 'user', content: user },
+            ],
+      }),
+      signal: AbortSignal.timeout(25_000),
+    });
+    if (!response.ok) {
+      const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get('retry-after'));
+      if (response.status === 429)
+        await recordProviderCooldown(env.DB, selection.model, retryAfterSeconds, response.status);
+      console.log(
+        JSON.stringify({
+          event: 'ai_provider_request',
+          attemptId,
+          stage,
+          model: selection.model,
+          inputTokens: 0,
+          outputTokens: 0,
+          batchSize,
+          responseStatus: response.status,
+          fallbackDecision: selection.fallbackDecision,
+        }),
+      );
+      if (response.status === 429)
+        throw new AiRateLimitedError(stage, retryAfterSeconds, selection.model);
+      throw new AiProviderResponseError(response.status);
+    }
+    const payload = groqResponseSchema.parse(await response.json());
+    const content = payload.choices[0]?.message.content;
+    if (content === undefined || content.trim() === '')
+      throw new Error('AI response content was empty.');
+    const usage = payload.usage ?? {};
+    console.log(
+      JSON.stringify({
+        event: 'ai_provider_request',
+        attemptId,
+        stage,
+        model: selection.model,
+        inputTokens: usage.prompt_tokens ?? 0,
+        outputTokens: usage.completion_tokens ?? 0,
+        batchSize,
+        responseStatus: response.status,
+        fallbackDecision: selection.fallbackDecision,
+      }),
+    );
+    return { content, usage };
+  } finally {
+    await releaseProviderGate(env.DB, providerLock, variables.AI_PROVIDER_MIN_INTERVAL_MS);
+  }
+}
+
+async function selectProviderModel(
+  db: D1Database,
+  stage: AiResponseStage,
+  generationModel: string,
+  verificationModel: string,
+): Promise<ProviderModelSelection> {
+  const models =
+    stage === 'generation' ? groqGenerationFallbackModels(generationModel) : [verificationModel];
+  const now = new Date();
+  const { results } = await db
+    .prepare(
+      `SELECT model,cooldown_until AS cooldownUntil
+         FROM ai_provider_model_cooldowns WHERE cooldown_until>?`,
+    )
+    .bind(now.toISOString())
+    .all<{ model: string; cooldownUntil: string }>();
+  const cooldowns = Object.fromEntries(results.map((row) => [row.model, row.cooldownUntil]));
+  const selected = selectAvailableGroqModel(models, cooldowns, now.getTime());
+  if ('retryAfterSeconds' in selected)
+    throw new AiRateLimitedError(stage, selected.retryAfterSeconds);
+  return selected;
+}
+
+export async function acquireProviderGate(
+  db: D1Database,
+  attemptId: string,
+  model: string,
+  stage: AiResponseStage,
+  minimumIntervalMs: number,
+): Promise<string> {
+  const token = crypto.randomUUID();
+  const now = new Date();
+  const leaseExpiresAt = new Date(now.getTime() + 35_000).toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE ai_provider_gate
+          SET lock_token=?,lock_attempt_id=?,lock_model=?,lock_stage=?,lock_expires_at=?,updated_at=?
+        WHERE id=1 AND next_allowed_at<=?
+          AND (lock_token IS NULL OR lock_expires_at IS NULL OR lock_expires_at<=?)`,
+    )
+    .bind(
+      token,
+      attemptId,
+      model,
+      stage,
+      leaseExpiresAt,
+      now.toISOString(),
+      now.toISOString(),
+      now.toISOString(),
+    )
+    .run();
+  if (result.meta.changes === 1) return token;
+  const gate = await db
+    .prepare(
+      'SELECT lock_expires_at AS lockExpiresAt,next_allowed_at AS nextAllowedAt FROM ai_provider_gate WHERE id=1',
+    )
+    .first<{ lockExpiresAt: string | null; nextAllowedAt: string }>();
+  const availableAt = Math.max(
+    now.getTime() + minimumIntervalMs,
+    ...[gate?.lockExpiresAt, gate?.nextAllowedAt]
+      .map((value) => Date.parse(value ?? ''))
+      .filter(Number.isFinite),
+  );
+  throw new AiRateLimitedError(
+    stage,
+    Math.max(1, Math.ceil((availableAt - now.getTime()) / 1_000)),
+  );
+}
+
+export async function releaseProviderGate(
+  db: D1Database,
+  token: string,
+  minimumIntervalMs: number,
+): Promise<void> {
+  const now = new Date();
+  await db
+    .prepare(
+      `UPDATE ai_provider_gate
+          SET lock_token=NULL,lock_attempt_id=NULL,lock_model=NULL,lock_stage=NULL,
+              lock_expires_at=NULL,next_allowed_at=?,updated_at=?
+        WHERE id=1 AND lock_token=?`,
+    )
+    .bind(new Date(now.getTime() + minimumIntervalMs).toISOString(), now.toISOString(), token)
+    .run();
+}
+
+export async function recordProviderCooldown(
+  db: D1Database,
+  model: string,
+  retryAfterSeconds: number,
+  status: number,
+): Promise<void> {
+  const now = new Date();
+  await db
+    .prepare(
+      `INSERT INTO ai_provider_model_cooldowns (model,cooldown_until,provider_status,updated_at)
+       VALUES (?,?,?,?)
+       ON CONFLICT(model) DO UPDATE SET cooldown_until=excluded.cooldown_until,
+         provider_status=excluded.provider_status,updated_at=excluded.updated_at`,
+    )
+    .bind(
+      model,
+      new Date(now.getTime() + retryAfterSeconds * 1_000).toISOString(),
+      status,
+      now.toISOString(),
+    )
+    .run();
 }
 
 function responseShape(content: string): Record<string, unknown> {
@@ -182,24 +364,45 @@ function validationIssue(error: unknown): Record<string, unknown> {
 
 async function groqStructured<T>(
   env: Env,
+  attemptId: string,
   stage: AiResponseStage,
   system: string,
   user: string,
   schema: string,
-  model: string,
   questionCount: number,
   parse: (content: string) => T,
 ): Promise<{ value: T; usage: GroqUsage }> {
-  const maxTokens = groqMaxTokens(stage, questionCount);
+  const variables = validateRuntimeEnvironment(env);
+  const selection = await selectProviderModel(
+    env.DB,
+    stage,
+    variables.GROQ_MODEL,
+    variables.GROQ_VERIFICATION_MODEL,
+  );
+  const maxTokens = groqMaxTokens(
+    stage,
+    questionCount,
+    variables.AI_GENERATION_MAX_OUTPUT_TOKENS,
+    variables.AI_VERIFICATION_MAX_OUTPUT_TOKENS,
+  );
   let first: { content: string; usage: GroqUsage } | undefined;
   try {
-    first = await groqContent(env, stage, model, system, user, maxTokens);
+    first = await groqContent(
+      env,
+      attemptId,
+      stage,
+      selection,
+      system,
+      user,
+      maxTokens,
+      questionCount,
+    );
     const value = parse(first.content);
     console.log(
       JSON.stringify({
         event: 'ai_response_shape',
         stage,
-        model,
+        model: selection.model,
         responseShape: responseShape(first.content),
         validationIssue: { kind: 'none', message: 'Validated on the initial response.' },
       }),
@@ -214,7 +417,7 @@ async function groqStructured<T>(
       JSON.stringify({
         event: 'ai_response_validation_failed',
         stage,
-        model,
+        model: selection.model,
         responseShape: shape,
         validationIssue: validationIssue(error),
       }),
@@ -226,14 +429,17 @@ async function groqStructured<T>(
 
   const repair = await groqContent(
     env,
+    attemptId,
     stage,
-    model,
-    `You repair ${stage} JSON. Return corrected JSON only: no Markdown, commentary, or extra keys.`,
+    selection,
+    `You repair ${stage} JSON. Return corrected JSON only: no Markdown, commentary, or extra keys.${stage === 'verification' ? ' Return exactly one result for every questionId in ORIGINAL_REQUEST; preserve each ID exactly, omit none, and keep rejectionReason null or at most 180 characters.' : ''}`,
     first
-      ? `Correct the following response so it matches this exact schema: ${schema}\nReturn only the corrected JSON object.\nRESPONSE_TO_REPAIR:\n${first.content}`
+      ? `Correct the response to satisfy the original request and this exact schema: ${schema}\nORIGINAL_REQUEST:\n${user}\nRESPONSE_TO_REPAIR:\n${first.content}`
       : `The previous response was rejected as invalid JSON. Complete the original request below and return only a JSON object matching this exact schema: ${schema}\nORIGINAL_REQUEST:\n${user}`,
     maxTokens,
+    questionCount,
     0,
+    true,
   );
   const usage = {
     prompt_tokens: (first?.usage.prompt_tokens ?? 0) + (repair.usage.prompt_tokens ?? 0),
@@ -246,7 +452,7 @@ async function groqStructured<T>(
       JSON.stringify({
         event: 'ai_response_shape',
         stage,
-        model,
+        model: selection.model,
         responseShape: responseShape(repair.content),
         validationIssue: { kind: 'none', message: 'Validated after one repair.' },
       }),
@@ -257,7 +463,7 @@ async function groqStructured<T>(
       JSON.stringify({
         event: 'ai_response_validation_failed',
         stage,
-        model,
+        model: selection.model,
         responseShape: responseShape(repair.content),
         validationIssue: validationIssue(error),
       }),
@@ -289,7 +495,7 @@ const candidateSnapshotSchema = z.object({
   accepted: z.array(stagedCandidateSchema),
   pending: z.array(stagedCandidateSchema),
   excluded: z.array(z.string()),
-  round: z.number().int().min(0).max(4),
+  round: z.number().int().min(0).max(120),
   rejectedCount: z.number().int().min(0),
   generationInputTokens: z.number().int().min(0).default(0),
   generationOutputTokens: z.number().int().min(0).default(0),
@@ -299,7 +505,7 @@ const candidateSnapshotSchema = z.object({
 type StagedCandidate = z.infer<typeof stagedCandidateSchema>;
 type CandidateSnapshot = z.infer<typeof candidateSnapshotSchema>;
 
-interface GenerationRunState {
+interface GenerationRunRecord {
   id: string;
   stage: string;
   status: string;
@@ -311,6 +517,95 @@ interface GenerationRunState {
   lock_expires_at: string | null;
   input_tokens: number;
   output_tokens: number;
+  state: GenerationRunStateName;
+  failed_stage: GenerationWorkStage | null;
+  failure_recoverable: number;
+  state_updated_at: string | null;
+  resume_count: number;
+}
+
+function attemptGenerationStatus(state: GenerationRunStateName): string {
+  if (state === 'pending') return 'pending';
+  if (state === 'ready' || state === 'completed') return 'ready';
+  if (state === 'verification_pending' || state === 'verifying') return 'verifying';
+  if (state === 'cancelled' || state === 'expired' || state === 'invalid') return 'failed';
+  return 'generating';
+}
+
+async function transitionGenerationState(
+  db: D1Database,
+  attemptId: string,
+  previousState: GenerationRunStateName,
+  nextState: GenerationRunStateName,
+  stage: GenerationWorkStage,
+  options: {
+    clearLock?: boolean;
+    error?: string | null;
+    lockToken?: string;
+    status?: 'pending' | 'running' | 'completed' | 'failed' | 'exhausted';
+  } = {},
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const lockClause = options.lockToken ? ' AND lock_token=?' : '';
+  const bindings: unknown[] = [
+    nextState,
+    nextState,
+    options.status ??
+      (nextState === 'ready' || nextState === 'completed' ? 'completed' : 'running'),
+    nextState === 'retryable' || nextState === 'rate_limited' ? stage : null,
+    nextState === 'retryable' ? 1 : 0,
+    options.error ?? null,
+    now,
+    options.clearLock ? 1 : 0,
+    options.clearLock ? 1 : 0,
+    options.clearLock ? 1 : 0,
+    attemptId,
+    previousState,
+  ];
+  if (options.lockToken) bindings.push(options.lockToken);
+  const result = await db
+    .prepare(
+      `UPDATE generation_runs
+          SET state=?,stage=?,status=?,failed_stage=?,failure_recoverable=?,error_summary=?,
+              state_updated_at=?,
+              lock_stage=CASE WHEN ?=1 THEN NULL ELSE lock_stage END,
+              lock_token=CASE WHEN ?=1 THEN NULL ELSE lock_token END,
+              lock_expires_at=CASE WHEN ?=1 THEN NULL ELSE lock_expires_at END
+        WHERE attempt_id=? AND state=?${lockClause}`,
+    )
+    .bind(...bindings)
+    .run();
+  if (result.meta.changes !== 1) return false;
+  await db
+    .prepare('UPDATE attempts SET generation_status=?,generation_error=? WHERE id=?')
+    .bind(attemptGenerationStatus(nextState), options.error ?? null, attemptId)
+    .run();
+  console.log(
+    JSON.stringify({
+      event: 'ai_generation_transition',
+      attemptId,
+      previousState,
+      nextState,
+      stage,
+    }),
+  );
+  return true;
+}
+
+function acceptedGenerationPayload(
+  attemptId: string,
+  status: GenerationRunStateName,
+  stage: GenerationWorkStage,
+  retryAfterSeconds = 20,
+) {
+  return {
+    attemptId,
+    errorCode: 'GENERATION_ACCEPTED' as const,
+    status,
+    stage,
+    retryAfterSeconds,
+    recoverable: true,
+  };
 }
 
 function emptySnapshot(): CandidateSnapshot {
@@ -359,7 +654,8 @@ async function acquireGenerationLock(
     .prepare(
       `UPDATE generation_runs
           SET lock_stage=?, lock_token=?, lock_expires_at=?,
-              auto_retry_used=CASE WHEN ?=1 THEN 1 ELSE auto_retry_used END
+              auto_retry_used=CASE WHEN ?=1 THEN 1 ELSE auto_retry_used END,
+              resume_count=resume_count+CASE WHEN state IN ('retryable','rate_limited') THEN 1 ELSE 0 END
         WHERE attempt_id=?
           AND (lock_token IS NULL OR lock_expires_at IS NULL OR lock_expires_at<=?)
           AND (?=0 OR auto_retry_used=0)`,
@@ -442,8 +738,10 @@ function rateLimitPayload(stage: AiResponseStage, retryAfterSeconds: number) {
   return {
     error: 'AI provider is cooling down. Your generated questions are safely preserved.',
     errorCode: 'AI_RATE_LIMITED' as const,
+    status: 'rate_limited' as const,
     stage,
     retryAfterSeconds,
+    recoverable: true,
   };
 }
 
@@ -458,14 +756,16 @@ async function requestFingerprint(request: AiTestRequest): Promise<string> {
   );
 }
 
-routes.get('/api/ai/config', (context) =>
-  context.json({
+routes.get('/api/ai/config', (context) => {
+  const variables = validateRuntimeEnvironment(context.env);
+  return context.json({
     examinations: aiExamConfigurations,
     questionCounts: [5, 10, 15, 20, 25, 50],
     stages: Object.values(stageLabels).slice(0, 5),
     similarityThreshold: 0.78,
-  }),
-);
+    clientRetrySeconds: variables.AI_CLIENT_RETRY_SECONDS,
+  });
+});
 
 routes.post('/api/ai/attempts', zValidator('json', aiTestRequestSchema), async (context) => {
   const variables = validateRuntimeEnvironment(context.env);
@@ -565,7 +865,42 @@ routes.post('/api/ai/attempts', zValidator('json', aiTestRequestSchema), async (
       ).bind(runId, id, visitor.visitor_number, fingerprint, activeKey, requestedCount, createdAt),
     ]);
   } catch {
-    return context.json({ error: 'An identical generation request is already running.' }, 409);
+    const existing = await context.env.DB.prepare(
+      `SELECT r.attempt_id AS attemptId,r.state,a.question_count AS questionCount
+         FROM generation_runs r JOIN attempts a ON a.id=r.attempt_id
+        WHERE r.active_key=? AND r.state NOT IN ('ready','completed','cancelled','expired','invalid')`,
+    )
+      .bind(activeKey)
+      .first<{ attemptId: string; state: GenerationRunStateName; questionCount: number }>();
+    if (!existing)
+      return context.json(
+        {
+          error: 'The attempt could not be created.',
+          errorCode: 'ATTEMPT_CREATE_CONFLICT',
+          recoverable: false,
+        },
+        409,
+      );
+    const existingToken = await signAttemptToken(
+      {
+        attemptId: existing.attemptId,
+        visitorNumber: visitor.visitor_number,
+        issuedAt: Math.floor(Date.now() / 1000),
+        nonce: crypto.randomUUID(),
+      },
+      secret,
+    );
+    return context.json(
+      {
+        attemptId: existing.attemptId,
+        attemptToken: existingToken,
+        generationStatus: existing.state,
+        status: existing.state,
+        errorCode: 'ATTEMPT_REUSED',
+        recoverable: true,
+      },
+      202,
+    );
   }
   await Promise.all([
     context.env.PUBLIC_CACHE.put(visitorKey, String(Number(visitorCount ?? 0) + 1), {
@@ -594,21 +929,20 @@ routes.get('/api/ai/attempts/:id/generation', async (context) => {
   const attempt = await authorizedAttempt(context.req.raw, context.env, context.req.param('id'));
   if (!attempt) return context.json({ error: 'Attempt not found.' }, 404);
   const run = await context.env.DB.prepare(
-    `SELECT stage,status,requested_count AS requestedCount,accepted_count AS acceptedCount,
+    `SELECT state,stage,status,requested_count AS requestedCount,accepted_count AS acceptedCount,
             rejected_count AS rejectedCount,error_summary AS error,cooldown_until AS cooldownUntil,
-            retry_stage AS retryStage,auto_retry_used AS autoRetryUsed,
-            CASE WHEN lock_token IS NOT NULL AND lock_expires_at>datetime('now') THEN 1 ELSE 0 END AS locked
+            COALESCE(failed_stage,retry_stage) AS retryStage,auto_retry_used AS autoRetryUsed,
+            CASE WHEN lock_token IS NOT NULL
+              AND lock_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') THEN 1 ELSE 0 END AS locked,
+            lock_expires_at AS lockExpiresAt
        FROM generation_runs WHERE attempt_id = ?`,
   )
     .bind(attempt.id)
-    .first<Record<string, unknown> & { stage: string }>();
+    .first<Record<string, unknown> & { stage: string; state: GenerationRunStateName }>();
   return context.json({
     ...run,
-    stageLabel: stageLabels[run?.stage ?? 'pending'] ?? 'Preparing examination pattern',
-    status:
-      run?.stage === 'rate_limited' || run?.stage === 'retry_failed'
-        ? run.stage
-        : run?.status,
+    stageLabel: stageLabels[run?.state ?? run?.stage ?? 'pending'],
+    status: run?.state ?? run?.status,
   });
 });
 
@@ -616,7 +950,8 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
   const attempt = await authorizedAttempt(context.req.raw, context.env, context.req.param('id'));
   if (!attempt) return context.json({ error: 'Attempt not found.' }, 404);
   const row = await context.env.DB.prepare(
-    'SELECT selection_json,generation_status,question_count,duration_seconds,examination_id,started_at,expires_at FROM attempts WHERE id = ?',
+    `SELECT selection_json,generation_status,question_count,duration_seconds,examination_id,
+            started_at,expires_at,status,submitted_at,score_json FROM attempts WHERE id = ?`,
   )
     .bind(attempt.id)
     .first<{
@@ -627,6 +962,9 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
       examination_id: string;
       started_at: string;
       expires_at: string;
+      status: 'active' | 'submitted' | 'timed_out' | 'abandoned';
+      submitted_at: string | null;
+      score_json: string | null;
     }>();
   if (!row) return context.json({ error: 'Attempt not found.' }, 404);
   if (row.generation_status === 'ready')
@@ -642,35 +980,115 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
       },
       200,
     );
-  const runState = await context.env.DB.prepare(
+  let runState = await context.env.DB.prepare(
     `SELECT id,stage,status,candidate_json,cooldown_until,retry_stage,auto_retry_used,
-            lock_token,lock_expires_at,input_tokens,output_tokens
+            lock_token,lock_expires_at,input_tokens,output_tokens,state,failed_stage,
+            failure_recoverable,state_updated_at,resume_count
        FROM generation_runs WHERE attempt_id=?`,
   )
     .bind(attempt.id)
-    .first<GenerationRunState>();
+    .first<GenerationRunRecord>();
   if (!runState) return context.json({ error: 'Generation run not found.' }, 404);
-  if (runState.status === 'failed' || runState.status === 'exhausted')
-    return context.json({ error: 'Generation cannot be resumed.' }, 409);
-  const automaticRetry = context.req.query('retry') === 'automatic';
-  let workStage: AiResponseStage =
-    runState.stage === 'rate_limited' ? (runState.retry_stage ?? 'generation') : 'generation';
-  if (runState.stage === 'rate_limited') {
-    const retryAt = Date.parse(runState.cooldown_until ?? '');
-    const remaining = Number.isFinite(retryAt)
-      ? Math.max(0, Math.ceil((retryAt - Date.now()) / 1_000))
-      : 0;
-    if (remaining > 0) return context.json(rateLimitPayload(workStage, remaining), 429);
-    if (automaticRetry && runState.auto_retry_used === 1)
-      return context.json(
-        {
-          error: 'Automatic retry was already used. Retry manually when cooldown ends.',
-          errorCode: 'AI_AUTO_RETRY_USED',
-          stage: workStage,
-        },
-        409,
-      );
+  if (row.score_json !== null || row.submitted_at !== null || row.status === 'submitted')
+    return context.json(
+      {
+        error: 'A scored attempt cannot be generated again.',
+        errorCode: 'ATTEMPT_INVALID',
+        status: 'invalid',
+        recoverable: false,
+      },
+      409,
+    );
+  if (
+    row.status === 'timed_out' ||
+    (row.status === 'active' && Date.now() >= Date.parse(row.expires_at))
+  ) {
+    await context.env.DB.batch([
+      context.env.DB.prepare(
+        `UPDATE generation_runs SET state='expired',stage='expired',status='failed',
+            failure_recoverable=0,active_key=NULL,state_updated_at=?,lock_stage=NULL,
+            lock_token=NULL,lock_expires_at=NULL WHERE attempt_id=?`,
+      ).bind(new Date().toISOString(), attempt.id),
+      context.env.DB.prepare(
+        `UPDATE attempts SET generation_status='failed',generation_error='Generation lease expired.',
+            status='abandoned' WHERE id=? AND status='active'`,
+      ).bind(attempt.id),
+    ]);
+    console.log(
+      JSON.stringify({
+        event: 'ai_generation_transition',
+        attemptId: attempt.id,
+        previousState: runState.state,
+        nextState: 'expired',
+        stage: runState.failed_stage ?? 'generation',
+      }),
+    );
+    return context.json(
+      {
+        error: 'This attempt expired before generation completed.',
+        errorCode: 'ATTEMPT_EXPIRED',
+        status: 'expired',
+        recoverable: false,
+      },
+      409,
+    );
   }
+  const automaticRetry = context.req.query('retry') === 'automatic';
+  const decision = decideGenerationAction({
+    state: runState.state,
+    failedStage: runState.failed_stage ?? runState.retry_stage,
+    cooldownUntil: runState.cooldown_until,
+    lockExpiresAt: runState.lock_expires_at,
+  });
+  if (decision.action === 'ready')
+    return context.json(
+      {
+        attemptId: attempt.id,
+        questionCount: row.question_count,
+        durationSeconds: row.duration_seconds,
+        startedAt: row.started_at,
+        expiresAt: row.expires_at,
+        generationStatus: 'ready',
+        status: 'ready',
+        stage: stageLabels.ready,
+      },
+      200,
+    );
+  if (decision.action === 'terminal')
+    return context.json(
+      {
+        error: 'This attempt cannot be resumed.',
+        errorCode: decision.errorCode,
+        status: runState.state,
+        recoverable: false,
+      },
+      409,
+    );
+  if (decision.action === 'already_running')
+    return context.json(
+      {
+        errorCode: 'GENERATION_ALREADY_RUNNING',
+        status: runState.state,
+        stage: runState.failed_stage ?? runState.retry_stage ?? 'generation',
+        retryAfterSeconds: Math.min(5, decision.retryAfterSeconds),
+        recoverable: true,
+      },
+      202,
+    );
+  if (decision.action === 'rate_limited')
+    return context.json(rateLimitPayload(decision.stage, decision.retryAfterSeconds), 429);
+  let workStage: AiResponseStage = decision.stage;
+  if (automaticRetry && runState.auto_retry_used === 1)
+    return context.json(
+      {
+        error: 'Automatic retry was already used. Retry manually when cooldown ends.',
+        errorCode: 'AI_AUTO_RETRY_USED',
+        status: runState.state,
+        stage: workStage,
+        recoverable: true,
+      },
+      409,
+    );
   const lockToken = await acquireGenerationLock(
     context.env.DB,
     attempt.id,
@@ -681,18 +1099,64 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
     return context.json(
       {
         error: 'Generation is already running for this attempt.',
-        errorCode: 'AI_GENERATION_IN_PROGRESS',
+        errorCode: 'GENERATION_ALREADY_RUNNING',
+        status: runState.state,
         stage: workStage,
+        retryAfterSeconds: 2,
+        recoverable: true,
       },
-      409,
+      202,
     );
+  const activeState: GenerationRunStateName =
+    workStage === 'verification' ? 'verifying' : 'generating';
+  const transitioned = await transitionGenerationState(
+    context.env.DB,
+    attempt.id,
+    runState.state,
+    activeState,
+    workStage,
+    { lockToken },
+  );
+  if (!transitioned) {
+    await releaseGenerationLock(context.env.DB, attempt.id, lockToken);
+    return context.json(
+      {
+        errorCode: 'GENERATION_ALREADY_RUNNING',
+        status: runState.state,
+        stage: workStage,
+        retryAfterSeconds: 2,
+        recoverable: true,
+      },
+      202,
+    );
+  }
+  runState = { ...runState, state: activeState };
   const request = aiTestRequestSchema.parse(JSON.parse(row.selection_json));
   const config = examConfiguration(request.examinationSlug);
   if (!config) {
-    await releaseGenerationLock(context.env.DB, attempt.id, lockToken);
-    return context.json({ error: 'Unsupported examination.' }, 400);
+    await transitionGenerationState(
+      context.env.DB,
+      attempt.id,
+      runState.state,
+      'invalid',
+      workStage,
+      { clearLock: true, error: 'Unsupported examination.', lockToken, status: 'failed' },
+    );
+    return context.json(
+      {
+        error: 'Unsupported examination.',
+        errorCode: 'ATTEMPT_INVALID',
+        status: 'invalid',
+        recoverable: false,
+      },
+      409,
+    );
   }
   const variables = validateRuntimeEnvironment(context.env);
+  const maxGenerationRounds = Math.min(
+    120,
+    Math.ceil(row.question_count / variables.AI_GENERATION_BATCH_SIZE) * 2 + 4,
+  );
   const snapshot = readSnapshot(runState.candidate_json);
   let totalInputTokens = runState.input_tokens;
   let totalOutputTokens = runState.output_tokens;
@@ -721,9 +1185,12 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
       UNION
       SELECT '' AS exact, q.question_text AS text, q.created_at AS seenAt
         FROM questions q WHERE q.verification_status='published'
+      UNION
+      SELECT normalized_sha256 AS exact, '' AS text, created_at AS seenAt
+        FROM attempt_generation_hashes WHERE attempt_id=?
       ORDER BY seenAt DESC LIMIT 900`,
     )
-      .bind(attempt.visitor_number, attempt.visitor_number)
+      .bind(attempt.visitor_number, attempt.visitor_number, attempt.id)
       .all<{ exact: string; text: string; seenAt: string }>();
     const history = await Promise.all(
       historyRows.map(async (item) => ({
@@ -763,18 +1230,20 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
       await saveSnapshot(context.env.DB, attempt.id, snapshot);
       if (modelCandidates.length === 0) return;
 
-      const verificationIds = modelCandidates.map((item) => item.questionId);
       await refreshGenerationLock(context.env.DB, attempt.id, lockToken, 'verification');
       const verification = await groqStructured(
         context.env,
+        attempt.id,
         'verification',
-        `Verify each MCQ independently. Reject ambiguity, a wrong proposed answer, weak support, unstable facts, missing context, unsafe content or syllabus drift. Do not repeat questions or options. Return only JSON matching: ${verificationResponseJsonSchema}`,
+        `Verify every supplied MCQ independently. Return exactly one result per questionId and preserve each ID. Keep rejectionReason null or at most 180 characters. Reject ambiguity, wrong answers, weak support, unstable facts, missing context, unsafe content or syllabus drift. Do not repeat questions or options. Return only JSON matching: ${verificationResponseJsonSchema}`,
         JSON.stringify(compactVerificationPayload(modelCandidates)),
         verificationResponseJsonSchema,
-        groqModelForStage('verification', variables.GROQ_MODEL, variables.GROQ_VERIFICATION_MODEL),
         modelCandidates.length,
         (content) =>
-          requireVerificationCoverage(parseVerificationContent(content), verificationIds),
+          requireVerificationCoverage(
+            parseVerificationContent(content),
+            modelCandidates.map((candidate) => candidate.questionId),
+          ),
       );
       await addSuccessfulUsage(context.env, attempt.id, verification.usage);
       totalInputTokens += verification.usage.prompt_tokens ?? 0;
@@ -782,8 +1251,9 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
       snapshot.verificationInputTokens += verification.usage.prompt_tokens ?? 0;
       snapshot.verificationOutputTokens += verification.usage.completion_tokens ?? 0;
       const reviews: VerificationBatch = verification.value;
+      const reviewById = new Map(reviews.results.map((review) => [review.questionId, review]));
       for (const candidate of modelCandidates) {
-        const review = reviews.results.find((item) => item.questionId === candidate.questionId);
+        const review = reviewById.get(candidate.questionId);
         const proposed = candidate.question.correctOptionIndex;
         const acceptedReview =
           review?.status === 'verified' &&
@@ -795,39 +1265,67 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
           const exact = await sha256(normaliseQuestion(candidate.question.question));
           snapshot.excluded.push(exact);
           excluded.push(exact);
-          continue;
+        } else {
+          candidate.verificationConfidence = review.confidence;
+          candidate.verificationReason =
+            review.rejectionReason ?? 'Independent model verification passed.';
+          candidate.verificationMethod = 'model';
+          snapshot.accepted.push(candidate);
+          accepted.push(candidate.question);
+          acceptedExact.add(await sha256(normaliseQuestion(candidate.question.question)));
         }
-        candidate.verificationConfidence = review.confidence;
-        candidate.verificationReason =
-          review.rejectionReason ?? 'Independent model verification passed.';
-        candidate.verificationMethod = 'model';
-        snapshot.accepted.push(candidate);
-        accepted.push(candidate.question);
-        acceptedExact.add(await sha256(normaliseQuestion(candidate.question.question)));
       }
       snapshot.pending = [];
       await saveSnapshot(context.env.DB, attempt.id, snapshot);
     };
 
+    const hadPendingCandidates = snapshot.pending.length > 0;
     await verifyPending();
-    for (
-      let round = snapshot.round;
-      round < 4 && accepted.length < row.question_count;
-      round += 1
+    if (
+      hadPendingCandidates &&
+      snapshot.round < maxGenerationRounds &&
+      accepted.length < row.question_count
     ) {
+      await transitionGenerationState(
+        context.env.DB,
+        attempt.id,
+        runState.state,
+        'generating',
+        'generation',
+        { clearLock: true, lockToken },
+      );
+      return context.json(
+        acceptedGenerationPayload(
+          attempt.id,
+          'generating',
+          'generation',
+          variables.AI_CLIENT_RETRY_SECONDS,
+        ),
+        202,
+      );
+    }
+    if (snapshot.round < maxGenerationRounds && accepted.length < row.question_count) {
+      const round = snapshot.round;
       workStage = 'generation';
       await updateStage(context.env.DB, attempt.id, 'generating');
       await refreshGenerationLock(context.env.DB, attempt.id, lockToken, 'generation');
-      const needed = row.question_count - accepted.length;
+      const needed = generationBatchSize(
+        row.question_count - accepted.length,
+        variables.AI_GENERATION_BATCH_SIZE,
+      );
       const generated = await groqStructured(
         context.env,
+        attempt.id,
         'generation',
         'Write syllabus-bound examination MCQs. Return JSON only.',
-        buildGenerationPrompt(config, request, needed, excluded, crypto.randomUUID()),
+        buildGenerationPrompt(config, request, needed, crypto.randomUUID()),
         generationResponseJsonSchema,
-        groqModelForStage('generation', variables.GROQ_MODEL, variables.GROQ_VERIFICATION_MODEL),
         needed,
-        parseGenerationContent,
+        (content) =>
+          parseGenerationContent(content, {
+            difficulty: request.difficulty === 'mixed' ? 'medium' : request.difficulty,
+            language: request.language,
+          }),
       );
       await addSuccessfulUsage(context.env, attempt.id, generated.usage);
       totalInputTokens += generated.usage.prompt_tokens ?? 0;
@@ -837,6 +1335,7 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
       const batch = generatedBatchSchema.parse(generated.value);
       await updateStage(context.env.DB, attempt.id, 'deduplicating');
       const candidates: GeneratedQuestion[] = [];
+      const candidateHashes: string[] = [];
       for (const question of batch.questions) {
         if (accepted.length + candidates.length >= row.question_count) break;
         const exact = await sha256(normaliseQuestion(question.question));
@@ -857,6 +1356,7 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
           continue;
         }
         candidates.push(question);
+        candidateHashes.push(exact);
       }
       snapshot.round = round + 1;
       snapshot.rejectedCount = rejectedCount;
@@ -865,9 +1365,43 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
         questionId: crypto.randomUUID(),
         question,
       }));
-      await saveSnapshot(context.env.DB, attempt.id, snapshot);
-      if (candidates.length === 0) continue;
-      await verifyPending();
+      const snapshotSavedAt = new Date().toISOString();
+      await context.env.DB.batch([
+        context.env.DB.prepare(
+          `UPDATE generation_runs
+                SET candidate_json=?,accepted_count=?,rejected_count=? WHERE attempt_id=?`,
+        ).bind(
+          JSON.stringify(snapshot),
+          snapshot.accepted.length,
+          snapshot.rejectedCount,
+          attempt.id,
+        ),
+        ...snapshot.pending.map((_, index) =>
+          context.env.DB.prepare(
+            `INSERT OR IGNORE INTO attempt_generation_hashes
+                (id,attempt_id,normalized_sha256,created_at) VALUES (?,?,?,?)`,
+          ).bind(crypto.randomUUID(), attempt.id, candidateHashes[index] ?? '', snapshotSavedAt),
+        ),
+      ]);
+      const nextState: GenerationRunStateName =
+        candidates.length === 0 ? 'generating' : 'verification_pending';
+      await transitionGenerationState(
+        context.env.DB,
+        attempt.id,
+        runState.state,
+        nextState,
+        candidates.length === 0 ? 'generation' : 'verification',
+        { clearLock: true, lockToken },
+      );
+      return context.json(
+        acceptedGenerationPayload(
+          attempt.id,
+          nextState,
+          candidates.length === 0 ? 'generation' : 'verification',
+          variables.AI_CLIENT_RETRY_SECONDS,
+        ),
+        202,
+      );
     }
     if (accepted.length !== row.question_count)
       throw new Error(
@@ -989,18 +1523,21 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
     const expiresAt = new Date(startedAt.getTime() + row.duration_seconds * 1000);
     statements.push(
       context.env.DB.prepare(
-        `UPDATE attempts SET generation_status='ready',comparison_key=?,started_at=?,expires_at=? WHERE id=?`,
+        `UPDATE attempts SET generation_status='ready',generation_error=NULL,status='active',
+            comparison_key=?,started_at=?,expires_at=? WHERE id=?`,
       ).bind(comparable, startedAt.toISOString(), expiresAt.toISOString(), attempt.id),
       context.env.DB.prepare(
         `UPDATE generation_runs
-            SET active_key=NULL,stage='ready',status='completed',accepted_count=?,
+            SET active_key=NULL,state='ready',stage='ready',status='completed',accepted_count=?,
                 rejected_count=?,estimated_cost_usd=?,completed_at=?,cooldown_until=NULL,
-                retry_stage=NULL,lock_stage=NULL,lock_token=NULL,lock_expires_at=NULL
+                retry_stage=NULL,failed_stage=NULL,failure_recoverable=0,state_updated_at=?,
+                lock_stage=NULL,lock_token=NULL,lock_expires_at=NULL
           WHERE attempt_id=? AND lock_token=?`,
       ).bind(
         accepted.length,
         rejectedCount,
         Number((totalInputTokens * 0.00000059 + totalOutputTokens * 0.00000079).toFixed(6)),
+        createdAt,
         createdAt,
         attempt.id,
         lockToken,
@@ -1033,6 +1570,15 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
         ),
       );
     await context.env.DB.batch(statements);
+    console.log(
+      JSON.stringify({
+        event: 'ai_generation_transition',
+        attemptId: attempt.id,
+        previousState: runState.state,
+        nextState: 'ready',
+        stage: 'verification',
+      }),
+    );
     return context.json({
       attemptId: attempt.id,
       questionCount: accepted.length,
@@ -1040,11 +1586,15 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
       startedAt: startedAt.toISOString(),
       expiresAt: expiresAt.toISOString(),
       generationStatus: 'ready',
+      status: 'ready',
       stage: stageLabels.ready,
     });
   } catch (error) {
     if (error instanceof AiRateLimitedError) {
-      const cooldownUntil = new Date(Date.now() + error.retryAfterSeconds * 1_000).toISOString();
+      const resumeAfterSeconds = error.model
+        ? Math.min(error.retryAfterSeconds, variables.AI_CLIENT_RETRY_SECONDS)
+        : error.retryAfterSeconds;
+      const cooldownUntil = new Date(Date.now() + resumeAfterSeconds * 1_000).toISOString();
       await context.env.DB.batch([
         context.env.DB.prepare(
           `UPDATE attempts SET generation_status=?,generation_error=? WHERE id=?`,
@@ -1055,36 +1605,61 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
         ),
         context.env.DB.prepare(
           `UPDATE generation_runs
-              SET stage='rate_limited',status='running',cooldown_until=?,retry_stage=?,
+              SET state='rate_limited',stage='rate_limited',status='running',cooldown_until=?,
+                  retry_stage=?,failed_stage=?,failure_recoverable=1,state_updated_at=?,
                   error_summary='AI provider cooldown is active.',lock_stage=NULL,
                   lock_token=NULL,lock_expires_at=NULL
             WHERE attempt_id=? AND lock_token=?`,
-        ).bind(cooldownUntil, error.stage, attempt.id, lockToken),
+        ).bind(
+          cooldownUntil,
+          error.stage,
+          error.stage,
+          new Date().toISOString(),
+          attempt.id,
+          lockToken,
+        ),
       ]);
-      return context.json(rateLimitPayload(error.stage, error.retryAfterSeconds), 429);
+      console.log(
+        JSON.stringify({
+          event: 'ai_generation_transition',
+          attemptId: attempt.id,
+          previousState: runState.state,
+          nextState: 'rate_limited',
+          stage: error.stage,
+        }),
+      );
+      return context.json(rateLimitPayload(error.stage, resumeAfterSeconds), 429);
     }
     if (automaticRetry) {
       const retryMessage = 'Automatic retry failed. The saved attempt can be retried manually.';
       await context.env.DB.batch([
         context.env.DB.prepare(
           `UPDATE attempts SET generation_status=?,generation_error=? WHERE id=?`,
-        ).bind(
-          workStage === 'verification' ? 'verifying' : 'generating',
-          retryMessage,
-          attempt.id,
-        ),
+        ).bind(workStage === 'verification' ? 'verifying' : 'generating', retryMessage, attempt.id),
         context.env.DB.prepare(
           `UPDATE generation_runs
-              SET stage='retry_failed',status='running',retry_stage=?,error_summary=?,
+              SET state='retryable',stage='retryable',status='running',retry_stage=?,
+                  failed_stage=?,failure_recoverable=1,error_summary=?,state_updated_at=?,
                   lock_stage=NULL,lock_token=NULL,lock_expires_at=NULL
             WHERE attempt_id=? AND lock_token=?`,
-        ).bind(workStage, retryMessage, attempt.id, lockToken),
+        ).bind(workStage, workStage, retryMessage, new Date().toISOString(), attempt.id, lockToken),
       ]);
+      console.log(
+        JSON.stringify({
+          event: 'ai_generation_transition',
+          attemptId: attempt.id,
+          previousState: runState.state,
+          nextState: 'retryable',
+          stage: workStage,
+        }),
+      );
       return context.json(
         {
           error: retryMessage,
           errorCode: 'AI_RETRY_FAILED',
+          status: 'retryable',
           stage: workStage,
+          recoverable: true,
         },
         503,
       );
@@ -1097,30 +1672,60 @@ routes.post('/api/ai/attempts/:id/generate', async (context) => {
         : 'Generation failed.';
     const errorCode = invalidResponse ? error.code : undefined;
     const errorStage = invalidResponse ? error.stage : undefined;
+    const terminal = message.includes('exhausted') && snapshot.round >= maxGenerationRounds;
+    const nextState: GenerationRunStateName = terminal ? 'invalid' : 'retryable';
+    const timestamp = new Date().toISOString();
     await context.env.DB.batch([
       context.env.DB.prepare(
-        `UPDATE attempts SET generation_status='failed',generation_error=?,status='abandoned' WHERE id=?`,
-      ).bind(message, attempt.id),
+        `UPDATE attempts SET generation_status=?,generation_error=?,
+            status=CASE WHEN ?=1 THEN 'abandoned' ELSE status END WHERE id=?`,
+      ).bind(
+        terminal ? 'failed' : attemptGenerationStatus(nextState),
+        message,
+        terminal ? 1 : 0,
+        attempt.id,
+      ),
       context.env.DB.prepare(
         `UPDATE generation_runs
-            SET active_key=NULL,stage='failed',status=?,rejected_count=?,
-                error_summary=?,completed_at=?,lock_stage=NULL,lock_token=NULL,lock_expires_at=NULL
+            SET active_key=CASE WHEN ?=1 THEN NULL ELSE active_key END,state=?,stage=?,status=?,
+                failed_stage=?,failure_recoverable=?,rejected_count=?,error_summary=?,
+                completed_at=CASE WHEN ?=1 THEN ? ELSE NULL END,state_updated_at=?,
+                lock_stage=NULL,lock_token=NULL,lock_expires_at=NULL
           WHERE attempt_id=? AND lock_token=?`,
       ).bind(
-        message.includes('exhausted') ? 'exhausted' : 'failed',
+        terminal ? 1 : 0,
+        nextState,
+        nextState,
+        terminal ? 'exhausted' : 'running',
+        workStage,
+        terminal ? 0 : 1,
         rejectedCount,
         message,
-        new Date().toISOString(),
+        terminal ? 1 : 0,
+        timestamp,
+        timestamp,
         attempt.id,
         lockToken,
       ),
     ]);
+    console.log(
+      JSON.stringify({
+        event: 'ai_generation_transition',
+        attemptId: attempt.id,
+        previousState: runState.state,
+        nextState,
+        stage: workStage,
+      }),
+    );
     return context.json(
       {
         error: message,
-        ...(errorCode && errorStage ? { code: errorCode, stage: errorStage } : {}),
+        errorCode: terminal ? 'GENERATION_EXHAUSTED' : (errorCode ?? 'AI_GENERATION_RETRYABLE'),
+        status: nextState,
+        stage: errorStage ?? workStage,
+        recoverable: !terminal,
       },
-      message.includes('exhausted') ? 409 : 503,
+      terminal ? 409 : 503,
     );
   }
 });

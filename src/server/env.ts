@@ -17,6 +17,11 @@ const runtimeVariablesSchema = z
     GROQ_VERIFICATION_MODEL: z.string().min(3).max(120).default('openai/gpt-oss-20b'),
     GROQ_API_KEY: z.string().min(20).optional(),
     AI_GENERATION_ENABLED: z.enum(['off', 'on']).default('on'),
+    AI_GENERATION_BATCH_SIZE: z.coerce.number().int().min(1).max(5).default(5),
+    AI_GENERATION_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(700).max(2200).default(2200),
+    AI_VERIFICATION_MAX_OUTPUT_TOKENS: z.coerce.number().int().min(300).max(1200).default(1200),
+    AI_PROVIDER_MIN_INTERVAL_MS: z.coerce.number().int().min(2100).max(60000).default(2100),
+    AI_CLIENT_RETRY_SECONDS: z.coerce.number().int().min(20).max(3600).default(20),
     AI_VISITOR_DAILY_LIMIT: z.coerce.number().int().min(1).max(100).default(5),
     AI_GLOBAL_DAILY_REQUEST_LIMIT: z.coerce.number().int().min(1).max(100000).default(500),
     AI_GLOBAL_DAILY_TOKEN_LIMIT: z.coerce

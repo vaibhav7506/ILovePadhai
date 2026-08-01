@@ -9,6 +9,7 @@ import {
   useMemo,
   useState,
 } from 'react';
+import { TurnstileWidget, turnstileEnabled } from './TurnstileWidget';
 
 const visitorKey = 'examforge.visitor_uuid';
 const sessionKey = 'examforge.session_uuid';
@@ -68,8 +69,11 @@ export function VisitorProvider({ children }: PropsWithChildren) {
   const [analyticsEnabled, setAnalyticsState] = useState(
     () => localStorage.getItem(consentKey) !== 'false',
   );
+  const [registrationToken, setRegistrationToken] = useState<string>();
+  const [turnstileError, setTurnstileError] = useState(false);
 
   useEffect(() => {
+    if (turnstileEnabled && !registrationToken) return;
     const controller = new AbortController();
     const visitorUuid = getOrCreateUuid(localStorage, visitorKey, readCookie('examforge_visitor'));
     const sessionUuid = getOrCreateUuid(sessionStorage, sessionKey);
@@ -84,6 +88,7 @@ export function VisitorProvider({ children }: PropsWithChildren) {
             landingPath: window.location.pathname,
             deviceCategory: categorizeDevice(navigator.userAgent),
             referrerCategory: categorizeReferrer(document.referrer, window.location.hostname),
+            ...(registrationToken ? { turnstileToken: registrationToken } : {}),
           }),
           signal: controller.signal,
         });
@@ -102,7 +107,7 @@ export function VisitorProvider({ children }: PropsWithChildren) {
     return () => {
       controller.abort();
     };
-  }, []);
+  }, [registrationToken]);
 
   const trackEvent = useCallback(
     async (eventType: PageEventInput['eventType'], path: string, examinationSlug?: string) => {
@@ -194,7 +199,25 @@ export function VisitorProvider({ children }: PropsWithChildren) {
     [analyticsEnabled, registration, resetData, setAnalyticsEnabled, status, trackEvent],
   );
 
-  return <VisitorContext value={value}>{children}</VisitorContext>;
+  return (
+    <VisitorContext value={value}>
+      {turnstileEnabled && status === 'loading' && !registrationToken && (
+        <div className="turnstile-gate" role="status" aria-live="polite">
+          <strong>Confirming you are human</strong>
+          <span>This protects anonymous learner access from automated abuse.</span>
+          <TurnstileWidget
+            action="register"
+            onError={() => {
+              setTurnstileError(true);
+            }}
+            onToken={setRegistrationToken}
+          />
+          {turnstileError && <span>Human verification could not load. Refresh to retry.</span>}
+        </div>
+      )}
+      {children}
+    </VisitorContext>
+  );
 }
 
 export function useVisitor(): VisitorContextValue {

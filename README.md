@@ -185,12 +185,12 @@ Prompt wording alone cannot reliably prevent repetition, so ExamForge adds its o
 <br />
 
 flowchart LR
-    A["Generate candidates"] --> B["Validate structure"]
-    B --> C["Create fingerprints"]
-    C --> D{"Seen before?"}
-    D -- "Yes" --> E["Regenerate"]
-    D -- "No" --> F["Prepare test"]
-    E --> B
+A["Generate candidates"] --> B["Validate structure"]
+B --> C["Create fingerprints"]
+C --> D{"Seen before?"}
+D -- "Yes" --> E["Regenerate"]
+D -- "No" --> F["Prepare test"]
+E --> B
 
 <br />
 
@@ -427,6 +427,27 @@ npm run deploy:dry
 Install Chromium once if Playwright requests it:
 
 npm run test:e2e:install
+
+</details>
+
+<details>
+  <summary><strong>Deploy to Cloudflare production</strong></summary>
+
+<br />
+
+Production commands always select the `production` Wrangler environment:
+
+```powershell
+npx wrangler secret put GROQ_API_KEY --env production
+npx wrangler secret put ATTEMPT_SIGNING_SECRET --env production
+npx wrangler secret put TURNSTILE_SECRET_KEY --env production
+npm run db:migrate:remote
+npm run deploy:dry
+npm run deploy
+```
+
+Set `VITE_TURNSTILE_SITE_KEY` in `.env.production`. Secrets must only be entered through
+`wrangler secret put`; never add them to an environment file that is committed.
 
 </details>
 
